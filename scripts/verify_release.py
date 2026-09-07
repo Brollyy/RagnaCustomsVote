@@ -24,6 +24,7 @@ def main() -> int:
         manifest = json.loads(archive.read("manifest.json"))
         assert manifest["schemaVersion"] == 1
         assert manifest["id"] == "ragnacustoms-vote"
+        assert manifest["author"] == "Brollyy"
         assert manifest["version"] == "0.1.0"
         assert manifest["game"] == "ragnarock"
         assert manifest["requires"] == {"manager": ">=1.1.0"}

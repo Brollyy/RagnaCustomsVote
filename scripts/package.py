@@ -20,7 +20,7 @@ def manifest() -> dict:
         "id": MOD_ID,
         "name": MOD_NAME,
         "version": VERSION,
-        "author": "RagnaCustoms contributors",
+        "author": "Brollyy",
         "game": "ragnarock",
         "description": "Flat and PC VR Results-screen voting controls for custom songs.",
         "requires": {"manager": ">=1.1.0"},
