@@ -238,6 +238,7 @@ local function findFlatInfoCanvas(panelPath)
 end
 
 local function findVrResultsCanvas(panel, panelPath)
+    -- TODO: Validate this root/fallback path against a stabilized VR Results hierarchy.
     -- VR Results has one canvas and no Info/Stats tab hierarchy.
     local tree = safeCall(function() return panel.WidgetTree end, nil)
     local root = tree and safeCall(function() return tree.RootWidget end, nil) or nil
