@@ -5,11 +5,12 @@ import json
 from pathlib import Path
 import zipfile
 
+from version import VERSION
+
 
 ROOT = Path(__file__).resolve().parents[1]
 MOD_NAME = "RagnaCustomsVote"
 MOD_ID = "ragnacustoms-vote"
-VERSION = "0.1.0"
 SOURCE_MOD = ROOT / "Mods" / MOD_NAME
 ARCHIVE_DATE = (1980, 1, 1, 0, 0, 0)
 
@@ -20,7 +21,7 @@ def manifest() -> dict:
         "id": MOD_ID,
         "name": MOD_NAME,
         "version": VERSION,
-        "author": "RagnaCustoms contributors",
+        "author": "Brollyy",
         "game": "ragnarock",
         "description": "Flat and PC VR Results-screen voting controls for custom songs.",
         "requires": {"manager": ">=1.1.0"},
