@@ -16,7 +16,9 @@ jobs:
         run: python3 scripts/package.py --output "dist/ragnacustoms-vote-${GITHUB_REF_NAME#v}.rmod"
       - name: Verify package
         run: python3 scripts/verify_release.py --package "dist/ragnacustoms-vote-${GITHUB_REF_NAME#v}.rmod"
+      - name: Create checksum
+        run: sha256sum "dist/ragnacustoms-vote-${GITHUB_REF_NAME#v}.rmod" > "dist/ragnacustoms-vote-${GITHUB_REF_NAME#v}.rmod.sha256"
       - name: Publish release asset
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.rmod
+          files: dist/ragnacustoms-vote-*
