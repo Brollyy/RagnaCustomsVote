@@ -191,9 +191,9 @@ local function rootPath(panelName)
         or tostring(panelName or "")
 end
 
-local function findInfoCanvas(panelPath)
-    -- The vote controls belong to the Info tab's hierarchy. This keeps them
-    -- hidden automatically whenever the Results screen switches tabs.
+local function findFlatInfoCanvas(panelPath)
+    -- Flat has tabs; keep controls in the Info tab hierarchy so they hide
+    -- automatically whenever the Results screen switches tabs.
     for _, className in ipairs({ "FlatItem_SongInfoEnd_C", "FlatItem_SongInfoEnd" }) do
         local widgets = safeCall(function()
             if type(FindAllOf) == "function" then return FindAllOf(className) end
@@ -235,6 +235,35 @@ local function findInfoCanvas(panelPath)
         end
     end
     return nil
+end
+
+local function findVrResultsCanvas(panel, panelPath)
+    -- VR Results has one canvas and no Info/Stats tab hierarchy.
+    local tree = safeCall(function() return panel.WidgetTree end, nil)
+    local root = tree and safeCall(function() return tree.RootWidget end, nil) or nil
+    if valid(root) and fullName(root):find(tostring(panelPath or ""), 1, true) ~= nil then
+        return root
+    end
+    if type(FindAllOf) == "function" then
+        local candidates = safeCall(function() return FindAllOf("CanvasPanel") end, {})
+        for _, candidate in ipairs(candidates or {}) do
+            local name = fullName(candidate)
+            if valid(candidate)
+                and visible(candidate)
+                and name:find(tostring(panelPath or ""), 1, true) ~= nil
+                and name:find("FlatLeaderboard_C_", 1, true) == nil then
+                return candidate
+            end
+        end
+    end
+    return nil
+end
+
+local function findVoteCanvas(panel, panelPath, mode)
+    if mode == "vr" then
+        return findVrResultsCanvas(panel, panelPath)
+    end
+    return findFlatInfoCanvas(panelPath)
 end
 
 local function construct(classPath, outer, name)
@@ -636,7 +665,7 @@ local function installButtonHooks()
 end
 
 local function createWidgets(panel, panelPath, mode)
-    local canvas = findInfoCanvas(panelPath)
+    local canvas = findVoteCanvas(panel, panelPath, mode)
     if not valid(canvas) then
         if not state.diagnostics.canvasMissing then
             state.diagnostics.canvasMissing = true
