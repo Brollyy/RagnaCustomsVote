@@ -5,11 +5,12 @@ import json
 from pathlib import Path
 import zipfile
 
+from version import VERSION
+
 
 ROOT = Path(__file__).resolve().parents[1]
 MOD_NAME = "RagnaCustomsVote"
 MOD_ID = "ragnacustoms-vote"
-VERSION = "0.2.0"
 SOURCE_MOD = ROOT / "Mods" / MOD_NAME
 ARCHIVE_DATE = (1980, 1, 1, 0, 0, 0)
 

@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 import zipfile
 
+from version import VERSION
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "Mods" / "RagnaCustomsVote" / "Scripts" / "main.lua"
@@ -14,7 +16,7 @@ EXPECTED_PACKAGE_FILES = {"manifest.json", "Scripts/main.lua"}
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Verify a RagnaCustomsVote .rmod package.")
-    parser.add_argument("--package", default="dist/ragnacustoms-vote-0.2.0.rmod")
+    parser.add_argument("--package", default=f"dist/ragnacustoms-vote-{VERSION}.rmod")
     args = parser.parse_args()
     package = Path(args.package)
     if not package.is_absolute():
@@ -24,7 +26,7 @@ def main() -> int:
         manifest = json.loads(archive.read("manifest.json"))
         assert manifest["schemaVersion"] == 1
         assert manifest["id"] == "ragnacustoms-vote"
-        assert manifest["version"] == "0.2.0"
+        assert manifest["version"] == VERSION
         assert manifest["game"] == "ragnarock"
         assert manifest["requires"] == {"manager": ">=1.1.0"}
         assert manifest["dependencies"] == {"ragnacustoms-api": ">=0.2.0"}
