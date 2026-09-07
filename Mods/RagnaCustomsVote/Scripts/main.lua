@@ -37,6 +37,9 @@ if type(Api) ~= "table" or type(Api.getVote) ~= "function" or type(Api.setVote) 
     return
 end
 
+-- This consumer explicitly opts into Ragnarock's canonical WanApi contract.
+Api.configure({ useWanApi = true })
+
 local state = _G.__ragnaCustomsVoteState or {
     hooksInstalled = false,
     buttonHooksInstalled = false,
@@ -72,11 +75,7 @@ local function applyLocalTestOverride()
             handle:close()
             local ok, override = pcall(dofile, path)
             if ok and type(override) == "table" then
-                local endpointOptions = {}
-                if override.useWanApi ~= nil then endpointOptions.useWanApi = override.useWanApi end
-                if override.wanApiScoreEndpoint ~= nil then endpointOptions.wanApiScoreEndpoint = override.wanApiScoreEndpoint end
-                if override.voteApiKey ~= nil then endpointOptions.voteApiKey = override.voteApiKey end
-                if next(endpointOptions) ~= nil then Api.configure(endpointOptions) end
+                if override.useWanApi ~= nil then Api.configure({ useWanApi = override.useWanApi }) end
                 if override.beatmap ~= nil then
                     state.beatmap = string.lower(tostring(override.beatmap))
                     state.custom = override.isCustom == true

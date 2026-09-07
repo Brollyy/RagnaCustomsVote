@@ -4,9 +4,10 @@
 excluded from both distributable `.rmod` packages.
 
 Copy it beside the deployed vote mod's `scripts/main.lua`. On startup, the vote
-mod loads the dependency library in its own UE4SS Lua state, configures it with
-the loopback-only fixture endpoint, and otherwise uses the game's normal custom
-song detection and beatmap-hash path. Live tests use the six-second `You Suffer`
+mod opts into the WanApi contract in the dependency library and uses the game's
+configured `CustomApiURLs`; it does not inject a vote endpoint. For local tests,
+configure the game/Game.ini `CustomApiURLs` entry to the loopback-only fixture.
+Live tests use the six-second `You Suffer`
 custom map whose server-side Wanadev beatmap hash is `3302932221`; the fixture
 must be installed in the game's `CustomSongs` directory and uploaded to the
 local RagnaCustoms server before launching the game.

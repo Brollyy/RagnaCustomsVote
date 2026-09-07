@@ -80,7 +80,6 @@ def main() -> int:
     assert "FlatItem_PlayerStats" not in source
     live_override = (ROOT / "tests" / "live" / "local_test_override.lua").read_text()
     assert "useWanApi" in live_override
-    assert "wanApiScoreEndpoint" in live_override
     assert "beatmap" not in live_override
     assert "isCustom" not in live_override
     print("vote UI contract ok")
