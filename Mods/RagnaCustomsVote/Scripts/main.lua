@@ -33,7 +33,7 @@ end
 
 Api = loadApiDependency()
 if type(Api) ~= "table" or type(Api.getVote) ~= "function" or type(Api.setVote) ~= "function" then
-    log("error", "RagnaCustomsApi >= 0.2.0 is required")
+    log("error", "RagnaCustomsApi >= 0.3.0 is required")
     return
 end
 
@@ -72,9 +72,11 @@ local function applyLocalTestOverride()
             handle:close()
             local ok, override = pcall(dofile, path)
             if ok and type(override) == "table" then
-                if override.scoreEndpoint ~= nil then
-                    Api.configure({ scoreEndpoint = override.scoreEndpoint })
-                end
+                local endpointOptions = {}
+                if override.useWanApi ~= nil then endpointOptions.useWanApi = override.useWanApi end
+                if override.wanApiScoreEndpoint ~= nil then endpointOptions.wanApiScoreEndpoint = override.wanApiScoreEndpoint end
+                if override.voteApiKey ~= nil then endpointOptions.voteApiKey = override.voteApiKey end
+                if next(endpointOptions) ~= nil then Api.configure(endpointOptions) end
                 if override.beatmap ~= nil then
                     state.beatmap = string.lower(tostring(override.beatmap))
                     state.custom = override.isCustom == true

@@ -8,7 +8,7 @@ UI = ROOT / "Mods" / "RagnaCustomsVote" / "Scripts" / "main.lua"
 def main() -> int:
     source = UI.read_text()
     for expected in [
-        "RagnaCustomsApi >= 0.2.0",
+        "RagnaCustomsApi >= 0.3.0",
         'className = "FlatInGameEndPanel_C"',
         "VRInGameEnd",
         'mode = "vr"',
@@ -79,7 +79,8 @@ def main() -> int:
     assert "FindFirstOf(candidate.className)" in source
     assert "FlatItem_PlayerStats" not in source
     live_override = (ROOT / "tests" / "live" / "local_test_override.lua").read_text()
-    assert "scoreEndpoint" in live_override
+    assert "useWanApi" in live_override
+    assert "wanApiScoreEndpoint" in live_override
     assert "beatmap" not in live_override
     assert "isCustom" not in live_override
     print("vote UI contract ok")

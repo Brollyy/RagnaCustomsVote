@@ -9,7 +9,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 MOD_NAME = "RagnaCustomsVote"
 MOD_ID = "ragnacustoms-vote"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 SOURCE_MOD = ROOT / "Mods" / MOD_NAME
 ARCHIVE_DATE = (1980, 1, 1, 0, 0, 0)
 
@@ -24,7 +24,7 @@ def manifest() -> dict:
         "game": "ragnarock",
         "description": "Flat and PC VR Results-screen voting controls for custom songs.",
         "requires": {"manager": ">=1.1.0"},
-        "dependencies": {"ragnacustoms-api": ">=0.2.0"},
+        "dependencies": {"ragnacustoms-api": ">=0.3.0"},
         "conflicts": [],
         "files": [{"type": "ue4ss-lua", "source": "Scripts/", "modFolder": MOD_NAME}],
         "affects": [],
