@@ -57,40 +57,9 @@ local state = _G.__ragnaCustomsVoteState or {
     createFailedPath = nil,
     error = nil,
     pressed = { up = false, down = false },
-    localTestOverride = nil,
 }
 _G.__ragnaCustomsVoteState = state
 state.diagnostics = state.diagnostics or {}
-
-local function applyLocalTestOverride()
-    if io == nil or type(io.open) ~= "function" then
-        return
-    end
-    for _, path in ipairs({
-        "Mods/RagnaCustomsVote/scripts/local_test_override.lua",
-        "Mods/RagnaCustomsVote/Scripts/local_test_override.lua",
-    }) do
-        local handle = io.open(path, "r")
-        if handle ~= nil then
-            handle:close()
-            local ok, override = pcall(dofile, path)
-            if ok and type(override) == "table" then
-                if override.useWanApi ~= nil then Api.configure({ useWanApi = override.useWanApi }) end
-                if override.beatmap ~= nil then
-                    state.beatmap = string.lower(tostring(override.beatmap))
-                    state.custom = override.isCustom == true
-                end
-                state.localTestOverride = override
-                log("info", "applied local test override")
-            else
-                log("error", "local test override could not be loaded")
-            end
-            return
-        end
-    end
-end
-
-applyLocalTestOverride()
 
 local function safeCall(callback, fallback)
     local ok, result = pcall(callback)
@@ -147,43 +116,34 @@ end
 
 local function customScoreSendingAllowed()
     if type(FindFirstOf) ~= "function" then return false end
-    local classes = { "RagnarockGameInstance", "RagnarockGameInstance_C", "BP_GameInstance_Retail_C", "GameInstance_C", "RRGameInstance", "RRGameInstance_C", "RagnarockSaveGameSubsystem" }
-    local methods = { "GetAllowSendingCustomSongScores", "GetAllowSendCustomSongScores", "GetAllowCustomSongScores", "GetAllowCustomScores", "IsAllowSendingCustomSongScores", "IsCustomSongScoreSendingAllowed" }
-    local properties = { "AllowSendingCustomSongScores", "AllowSendCustomSongScores", "AllowCustomSongScores", "AllowCustomScores", "bAllowSendingCustomSongScores", "bAllowCustomSongScores" }
-    for _, className in ipairs(classes) do
-        local object = safeCall(function() return FindFirstOf(className) end, nil)
-        if valid(object) then
-            for _, method in ipairs(methods) do
-                local result = asBoolean(safeCall(function() return object[method](object) end, nil))
-                if result ~= nil then return result end
-            end
-            for _, property in ipairs(properties) do
-                local result = asBoolean(safeCall(function() return object:GetPropertyValue(property) end, nil))
-                if result ~= nil then return result end
-            end
-        end
+    local gameInstance = safeCall(function() return FindFirstOf("RagnarockGameInstance") end, nil)
+    if valid(gameInstance) then
+        local result = asBoolean(safeCall(function()
+            return gameInstance:GetAllowSendingCustomSongScores()
+        end, nil))
+        if result ~= nil then return result end
     end
-    -- Older builds do not expose this preference through UE4SS reflection. Keep
-    -- the panel available in that case; an explicitly exposed false value above
-    -- always suppresses it.
+    -- Older builds do not expose the setting. Keep the panel available there.
     return true
 end
 
-local function findActiveResultsPanel()
-    if type(FindFirstOf) ~= "function" then
-        return nil
-    end
-    for _, candidate in ipairs({
-        { className = "FlatInGameEndPanel_C", mode = "flat" },
-        { className = "VRInGameEndPanel_C", mode = "vr" },
-        { className = "InGameEndPanel_C", mode = "vr" },
-        { className = "InGameEndMenu_C", mode = "vr" },
-    }) do
+local RESULT_FLOWS = {
+    flat = {
+        panelClasses = { "FlatInGameEndPanel_C" },
+        buttonClass = "/Game/Flat/Blueprints/UI/InGame/FlatInGameButton.FlatInGameButton_C",
+    },
+    vr = {
+        -- TODO: The VR Results hierarchy is not stabilized yet.
+        panelClasses = { "VRInGameEndPanel_C", "InGameEndPanel_C", "InGameEndMenu_C" },
+        buttonClass = "/Game/VRKeyboards/Blueprints/Keyboards/BasicPointAndClick/WBP_Button_Basic.WBP_Button_Basic_C",
+    },
+}
+
+local function findResultsPanelForFlow(flow)
+    for _, className in ipairs(flow.panelClasses) do
         local objects = safeCall(function()
-            if type(FindAllOf) == "function" then
-                return FindAllOf(candidate.className)
-            end
-            return { FindFirstOf(candidate.className) }
+            if type(FindAllOf) == "function" then return FindAllOf(className) end
+            return { FindFirstOf(className) }
         end, {})
         for _, object in ipairs(objects or {}) do
             local objectName = fullName(object)
@@ -191,9 +151,36 @@ local function findActiveResultsPanel()
                 and objectName:find("/Engine/Transient.", 1, true) ~= nil
                 and objectName:find("Default__", 1, true) == nil
                 and visible(object) then
-                return object, objectName, candidate.mode
+                return object, objectName
             end
         end
+    end
+    return nil
+end
+
+local function findFlatResultsPanel()
+    local panel, name = findResultsPanelForFlow(RESULT_FLOWS.flat)
+    if panel ~= nil then return panel, name, "flat" end
+    return nil
+end
+
+local function findVrResultsPanel()
+    local panel, name = findResultsPanelForFlow(RESULT_FLOWS.vr)
+    if panel ~= nil then return panel, name, "vr" end
+    return nil
+end
+
+local function findActiveResultsPanel()
+    if type(FindFirstOf) ~= "function" then
+        return nil
+    end
+    local panel, name, mode = findFlatResultsPanel()
+    if panel ~= nil then
+        return panel, name, mode
+    end
+    panel, name, mode = findVrResultsPanel()
+    if panel ~= nil then
+        return panel, name, mode
     end
     return nil
 end
@@ -382,9 +369,7 @@ local function objectPath(object)
 end
 
 local function makeButton(canvas, context, mode, label, geometry)
-    local classPath = mode == "vr"
-        and "/Game/VRKeyboards/Blueprints/Keyboards/BasicPointAndClick/WBP_Button_Basic.WBP_Button_Basic_C"
-        or "/Game/Flat/Blueprints/UI/InGame/FlatInGameButton.FlatInGameButton_C"
+    local classPath = RESULT_FLOWS[mode].buttonClass
     log("info", "vote button create begin label=" .. tostring(label))
     local root = createUserWidget(classPath, context)
     log("info", "vote button create done label=" .. tostring(label))
@@ -878,10 +863,6 @@ local function poll()
         state.diagnostics.pollStarted = true
         log("info", "Results UI polling started")
     end
-    if type(state.localTestOverride) == "table" and state.localTestOverride.beatmap ~= nil then
-        state.beatmap = string.lower(tostring(state.localTestOverride.beatmap))
-        state.custom = state.localTestOverride.isCustom == true
-    end
     local panel, panelName, mode = findActiveResultsPanel()
     local manager, managerName = nil, nil
     if panel ~= nil then
@@ -902,11 +883,9 @@ local function poll()
         end
         return
     end
-    -- Reflected GameInstance getters are game-thread calls. Do not invoke them
-    -- on every 500 ms poll during gameplay; probe once initially and again only
-    -- when a new Results panel instance is observed.
-    local panelPathForProbe = panel ~= nil and rootPath(panelName) or nil
-    if state.customScoresAllowed == nil or (panelPathForProbe ~= nil and state.lastSettingPanelPath ~= panelPathForProbe) then
+    -- Reflected GameInstance getters are game-thread calls. Probe the single
+    -- stable setting once rather than invoking reflection on every poll.
+    if state.customScoresAllowed == nil then
         -- Reflection against GameInstance/SaveGame is a game-thread operation.
         -- Never perform it directly from LoopAsync's worker callback: doing so
         -- can stall the menu while the song selector is constructing its list.
@@ -914,7 +893,6 @@ local function poll()
             state.settingProbeQueued = true
             local function probeOnGameThread()
                 state.customScoresAllowed = customScoreSendingAllowed()
-                state.lastSettingPanelPath = panelPathForProbe
                 state.settingProbeQueued = false
             end
             if type(ExecuteInGameThread) == "function" then
