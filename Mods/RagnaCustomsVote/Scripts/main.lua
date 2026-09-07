@@ -11,7 +11,7 @@ local function log(level, message)
 end
 
 local function loadApiDependency()
-    if type(Api) == "table" and type(Api.getVote) == "function" and type(Api.setVote) == "function" then
+    if type(Api) == "table" and type(Api.getWanApiVote) == "function" and type(Api.setWanApiVote) == "function" then
         return Api
     end
 
@@ -32,8 +32,8 @@ local function loadApiDependency()
 end
 
 Api = loadApiDependency()
-if type(Api) ~= "table" or type(Api.getVote) ~= "function" or type(Api.setVote) ~= "function" then
-    log("error", "RagnaCustomsApi >= 0.3.0 is required")
+if type(Api) ~= "table" or type(Api.getWanApiVote) ~= "function" or type(Api.setWanApiVote) ~= "function" then
+    log("error", "RagnaCustomsApi >= 0.2.0 is required")
     return
 end
 
@@ -555,7 +555,7 @@ end
 local function loadVote()
     state.phase = "loading"
     render()
-    local _, err = Api.getVote(state.beatmap, applyResponse)
+    local _, err = Api.getWanApiVote(state.beatmap, applyResponse)
     if err ~= nil then
         applyResponse({ ok = false, error = { code = "start_failed", message = err } })
     end
@@ -573,7 +573,7 @@ local function submit(direction)
         .. " requested=" .. tostring(direction) .. " desired=" .. tostring(desired))
     state.phase = "submitting"
     render()
-    local _, err = Api.setVote(state.beatmap, desired, applyResponse)
+    local _, err = Api.setWanApiVote(state.beatmap, desired, applyResponse)
     if err ~= nil then
         applyResponse({ ok = false, error = { code = "start_failed", message = err } })
     end

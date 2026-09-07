@@ -8,7 +8,7 @@ UI = ROOT / "Mods" / "RagnaCustomsVote" / "Scripts" / "main.lua"
 def main() -> int:
     source = UI.read_text()
     for expected in [
-        "RagnaCustomsApi >= 0.3.0",
+        "RagnaCustomsApi >= 0.2.0",
         'className = "FlatInGameEndPanel_C"',
         "VRInGameEnd",
         'mode = "vr"',
@@ -20,8 +20,8 @@ def main() -> int:
         "clickedPath == entry.objectPath",
         "installButtonHooks()",
         "state.buttonHooksInstalled",
-        "Api.getVote",
-        "Api.setVote",
+        "Api.getWanApiVote",
+        "Api.setWanApiVote",
         'state.custom ~= true',
         'state.phase = "loading"',
         'state.phase = "submitting"',
