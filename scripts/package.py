@@ -24,7 +24,7 @@ def manifest() -> dict:
         "author": "Brollyy",
         "game": "ragnarock",
         "description": "Flat and PC VR Results-screen voting controls for custom songs.",
-        "requires": {"manager": ">=1.1.0"},
+        "requires": {"manager": ">=0.2.0"},
         "dependencies": {"ragnacustoms-api": ">=0.2.0"},
         "conflicts": [],
         "files": [{"type": "ue4ss-lua", "source": "Scripts/", "modFolder": MOD_NAME}],
