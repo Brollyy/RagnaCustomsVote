@@ -502,7 +502,10 @@ local function render()
     local downColor = state.currentVote == "down" and COLORS.down or COLORS.normal
     safeCall(function() widgets.up.button:SetColorAndOpacity(upColor) end, nil)
     safeCall(function() widgets.down.button:SetColorAndOpacity(downColor) end, nil)
-    local enabled = state.phase == "ready" or state.phase == "error"
+    -- A failed request is terminal for this panel. Keeping the controls
+    -- disabled prevents retries while the timed-out native request may still
+    -- be owned by VaRest/UE4SS, which can otherwise crash the game.
+    local enabled = state.phase == "ready"
     safeCall(function()
         widgets.up.button:SetIsEnabled(enabled)
         widgets.down.button:SetIsEnabled(enabled)
@@ -515,7 +518,7 @@ local function render()
     elseif state.phase == "submitting" then
         status = "Saving vote..."
     elseif state.phase == "error" then
-        status = "Vote unavailable - press to retry"
+        status = "Vote unavailable"
     end
     if state.phase ~= "loading" and state.phase ~= "submitting" then
         setText(widgets.up.text, "▲ " .. tostring(state.upvotes or 0))
@@ -577,7 +580,7 @@ local function loadVote()
 end
 
 local function submit(direction)
-    if state.phase ~= "ready" and state.phase ~= "error" then
+    if state.phase ~= "ready" then
         return
     end
     local desired = direction
