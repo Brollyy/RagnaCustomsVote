@@ -60,6 +60,16 @@ local state = _G.__ragnaCustomsVoteState or {
 }
 _G.__ragnaCustomsVoteState = state
 state.diagnostics = state.diagnostics or {}
+-- The authoritative VR fixture uses a disposable local beatmap key.  Keep
+-- this opt-in so normal installs continue to use Ragnarock's runtime hash.
+if os ~= nil and type(os.getenv) == "function" then
+    local testBeatmap = os.getenv("RAGNA_TEST_BEATMAP")
+    if testBeatmap ~= nil and testBeatmap ~= "" then
+        state.beatmap = testBeatmap
+        state.custom = true
+        log("info", "test beatmap override applied hash=" .. tostring(testBeatmap))
+    end
+end
 
 local function safeCall(callback, fallback)
     local ok, result = pcall(callback)
@@ -174,6 +184,28 @@ local function findActiveResultsPanel()
     if type(FindFirstOf) ~= "function" then
         return nil
     end
+    -- In VR the visible Results board is rendered by SongInfoWidget. Prefer
+    -- its actual UserWidget over the transient flat end-panel mirror so added
+    -- controls are painted by the same WidgetComponent as the difficulty.
+    if type(FindAllOf) == "function" then
+        for _, component in ipairs(safeCall(function() return FindAllOf("WidgetComponent") end, {}) or {}) do
+            if valid(component) and fullName(component):find(".SongInfoWidget", 1, true) ~= nil then
+                local widget = safeCall(function() return component:GetUserWidgetObject() end, nil)
+                if valid(widget) then
+                    local widgetPath = fullName(widget)
+                    return widget, widgetPath, "vr"
+                end
+            end
+        end
+        for _, component in ipairs(safeCall(function() return FindAllOf("WidgetComponent") end, {}) or {}) do
+            if valid(component) and fullName(component):find(".ScoreboardWidget", 1, true) ~= nil then
+                local widget = safeCall(function() return component:GetUserWidgetObject() end, nil)
+                if valid(widget) then
+                    return widget, fullName(widget), "vr"
+                end
+            end
+        end
+    end
     local panel, name, mode = findFlatResultsPanel()
     if panel ~= nil then
         return panel, name, mode
@@ -181,6 +213,20 @@ local function findActiveResultsPanel()
     panel, name, mode = findVrResultsPanel()
     if panel ~= nil then
         return panel, name, mode
+    end
+    -- In VR, the Results board keeps the stock Flat* widget tree, but the
+    -- owning FlatInGameEndPanel_C is not returned by FindAllOf. Use the live
+    -- transient SongInfo widget as the Results anchor instead.
+    for _, className in ipairs({ "Item_SongInfoEnd_C", "FlatItem_SongInfoEnd_C" }) do
+        for _, object in ipairs(safeCall(function() return FindAllOf(className) end, {}) or {}) do
+            local objectName = fullName(object)
+            if valid(object)
+                and objectName:find("/Engine/Transient.", 1, true) ~= nil
+                and visible(object) then
+                local ownerPath = objectName:match("^([^:]+:[^:]+)") or objectName
+                return object, ownerPath, "flat"
+            end
+        end
     end
     return nil
 end
@@ -194,16 +240,18 @@ end
 local function findFlatInfoCanvas(panelPath)
     -- Flat has tabs; keep controls in the Info tab hierarchy so they hide
     -- automatically whenever the Results screen switches tabs.
-    for _, className in ipairs({ "FlatItem_SongInfoEnd_C", "FlatItem_SongInfoEnd" }) do
+    for _, className in ipairs({ "Item_SongInfoEnd_C", "FlatItem_SongInfoEnd_C", "FlatItem_SongInfoEnd" }) do
         local widgets = safeCall(function()
             if type(FindAllOf) == "function" then return FindAllOf(className) end
             return { FindFirstOf(className) }
         end, {})
         for _, infoWidget in ipairs(widgets or {}) do
             local name = fullName(infoWidget)
+            local vrScoreboardFallback = tostring(panelPath or ""):find("ScoreboardWidget", 1, true) ~= nil
             if valid(infoWidget)
                 and visible(infoWidget)
-                and name:find(tostring(panelPath or ""), 1, true) ~= nil then
+                and (name:find(tostring(panelPath or ""), 1, true) ~= nil
+                    or vrScoreboardFallback) then
                 local tree = safeCall(function() return infoWidget.WidgetTree end, nil)
                 local root = tree and safeCall(function() return tree.RootWidget end, nil) or nil
                 if valid(root) then
@@ -217,6 +265,7 @@ local function findFlatInfoCanvas(panelPath)
         end
     end
     if type(FindAllOf) == "function" then
+        local hostName = valid(panel) and fullName(panel) or nil
         local candidates = safeCall(function() return FindAllOf("CanvasPanel") end, {})
         for _, candidate in ipairs(candidates or {}) do
             local name = fullName(candidate)
@@ -237,37 +286,97 @@ local function findFlatInfoCanvas(panelPath)
     return nil
 end
 
-local function findVrResultsCanvas(panel, panelPath)
-    -- TODO: Validate this root/fallback path against a stabilized VR Results hierarchy.
-    -- VR Results has one canvas and no Info/Stats tab hierarchy.
-    local tree = safeCall(function() return panel.WidgetTree end, nil)
-    local root = tree and safeCall(function() return tree.RootWidget end, nil) or nil
-    if valid(root) and fullName(root):find(tostring(panelPath or ""), 1, true) ~= nil then
-        return root
-    end
-    if type(FindAllOf) == "function" then
-        local candidates = safeCall(function() return FindAllOf("CanvasPanel") end, {})
-        for _, candidate in ipairs(candidates or {}) do
-            local name = fullName(candidate)
-            if valid(candidate)
-                and visible(candidate)
-                and name:find(tostring(panelPath or ""), 1, true) ~= nil
-                and name:find("FlatLeaderboard_C_", 1, true) == nil then
-                return candidate
-            end
+local construct
+
+
+
+local function findVrSongInfoComponent()
+    if type(FindAllOf) ~= "function" then return nil end
+    for _, component in ipairs(safeCall(function() return FindAllOf("WidgetComponent") end, {}) or {}) do
+        if valid(component) and fullName(component):find(".SongInfoWidget", 1, true) ~= nil then
+            log("info", "VR SongInfo overlay source=" .. fullName(component))
+            return component
         end
     end
     return nil
 end
 
-local function findVoteCanvas(panel, panelPath, mode)
-    if mode == "vr" then
-        return findVrResultsCanvas(panel, panelPath)
+
+local function findVrStatsComponent()
+    if type(FindAllOf) ~= "function" then return nil end
+    local best = nil
+    local bestScale = -1.0
+    for _, component in ipairs(safeCall(function() return FindAllOf("WidgetComponent") end, {}) or {}) do
+        local name = fullName(component)
+        if valid(component) and name:find(".StatsWidget", 1, true) ~= nil
+            and safeCall(function() return component:IsVisible() end, false) then
+            local user = safeCall(function() return component:GetUserWidgetObject() end, nil)
+            local scale = safeCall(function() return component:K2_GetComponentScale() end, nil)
+            local value = tonumber(scale and scale.X) or 0.0
+            log("info", "VR StatsWidget candidate=" .. name .. " user=" .. tostring(valid(user)) .. " scale=" .. tostring(value))
+            -- The rendered Results Distance surface is StatsPopup. The
+            -- larger BP_PlayerStats component is a reflected duplicate and
+            -- accepts children without painting them in VR.
+            local isRenderedPopup = name:find("BP_StatsPopup_C_", 1, true) ~= nil
+            if valid(user) and (isRenderedPopup or value > bestScale) then
+                best = component
+                bestScale = value
+                if isRenderedPopup then break end
+            end
+        end
     end
+    if valid(best) then
+        state.statsComponent = best
+        state.statsUser = safeCall(function() return best:GetUserWidgetObject() end, nil)
+        local tree = valid(state.statsUser) and safeCall(function() return state.statsUser.WidgetTree end, nil) or nil
+        state.statsTree = tree
+        state.statsRoot = valid(tree) and safeCall(function() return tree.RootWidget end, nil) or nil
+        log("info", "VR StatsWidget selected=" .. fullName(best) .. " scale=" .. tostring(bestScale))
+    end
+    return best
+end
+
+local function findVrScoreboardSurface()
+    if type(FindAllOf) ~= "function" then return nil, nil, nil end
+    for _, component in ipairs(safeCall(function() return FindAllOf("WidgetComponent") end, {}) or {}) do
+        local name = fullName(component)
+        if valid(component)
+            and name:find(".ScoreboardWidget", 1, true) ~= nil
+            and safeCall(function() return component:IsVisible() end, false) then
+            local user = safeCall(function() return component:GetUserWidgetObject() end, nil)
+            local tree = valid(user) and safeCall(function() return user.WidgetTree end, nil) or nil
+            local root = valid(tree) and safeCall(function() return tree.RootWidget end, nil) or nil
+            if valid(user) and valid(root) then
+                -- CanvasPanel_1 is the authored Distance subpanel and is
+                -- clipped to the stock stats band.  Use the component root
+                -- surface for the mod-owned controls so they can occupy the
+                -- unused space beside Distance without moving stock widgets.
+                safeCall(function() user:SetVisibility(0) end, nil)
+                safeCall(function() user:SetIsEnabled(true) end, nil)
+                safeCall(function() root:SetVisibility(0) end, nil)
+                safeCall(function() root:SetIsEnabled(true) end, nil)
+                -- Set the reflected flags directly.  The setter method
+                -- rebuilds the WidgetComponent render target synchronously
+                -- on this build and can stall the UE4SS event loop.
+                safeCall(function() component:SetPropertyValue("bReceiveHardwareInput", true) end, nil)
+                safeCall(function() component:SetPropertyValue("bWindowFocusable", true) end, nil)
+                state.scoreboardComponent = component
+                state.scoreboardUser = user
+                state.scoreboardRoot = root
+                log("info", "VR Scoreboard surface selected component=" .. name
+                    .. " root=" .. fullName(root))
+                return component, user, root
+            end
+        end
+    end
+    return nil, nil, nil
+end
+
+local function findVoteCanvas(panel, panelPath, mode)
     return findFlatInfoCanvas(panelPath)
 end
 
-local function construct(classPath, outer, name)
+construct = function(classPath, outer, name)
     if type(StaticFindObject) ~= "function" or type(StaticConstructObject) ~= "function" then
         return nil
     end
@@ -288,6 +397,21 @@ local function construct(classPath, outer, name)
     end, nil)
 end
 
+local function constructInWidgetTree(tree, classPath, name)
+    if not valid(tree) or type(StaticFindObject) ~= "function" then
+        return nil
+    end
+    local class = safeCall(function() return StaticFindObject(classPath) end, nil)
+    if not valid(class) then return nil end
+    local objectName = 0
+    if name ~= nil and type(FName) == "function" then
+        objectName = safeCall(function() return FName(name) end, 0)
+    end
+    return safeCall(function()
+        return tree:ConstructWidget(class, objectName)
+    end, nil)
+end
+
 local function setText(widget, value)
     if not valid(widget) then
         return false
@@ -303,17 +427,24 @@ local function addToCanvas(canvas, widget, geometry)
     local slot = safeCall(function()
         return canvas:AddChildToCanvas(widget)
     end, nil)
+    -- VR StatsWidget has a HorizontalBox root. Append the mod-owned canvas to
+    -- that root so stock Distance/stat children keep their layout.
+    if not valid(slot) then
+        slot = safeCall(function()
+            return canvas:AddChild(widget)
+        end, nil)
+    end
     if not valid(slot) then
         return false
     end
     local function configure(targetSlot)
-        targetSlot:SetAutoSize(false)
+        safeCall(function() targetSlot:SetAutoSize(false) end, nil)
         if geometry.anchorRight then
             targetSlot:SetAnchors({ Minimum = { X = 1.0, Y = 0.0 }, Maximum = { X = 1.0, Y = 0.0 } })
         end
-        targetSlot:SetPosition({ X = geometry.x, Y = geometry.y })
-        targetSlot:SetSize({ X = geometry.width, Y = geometry.height })
-        targetSlot:SetZOrder(geometry.z or 9000)
+        safeCall(function() targetSlot:SetPosition({ X = geometry.x, Y = geometry.y }) end, nil)
+        safeCall(function() targetSlot:SetSize({ X = geometry.width, Y = geometry.height }) end, nil)
+        safeCall(function() targetSlot:SetZOrder(geometry.z or 9000) end, nil)
     end
     safeCall(function() configure(slot) end, nil)
     -- On this build the returned slot can be a stale wrapper.
@@ -340,9 +471,19 @@ local function addButtonToCanvas(canvas, widget, geometry)
     if not valid(slot) then return false end
     safeCall(function()
         slot:SetAutoSize(false)
+        if geometry.anchorRight then
+            slot:SetAnchors({ Minimum = { X = 1.0, Y = 0.0 }, Maximum = { X = 1.0, Y = 0.0 } })
+        end
         slot:SetPosition({ X = geometry.x, Y = geometry.y })
         slot:SetSize({ X = geometry.width, Y = geometry.height })
         slot:SetZOrder(geometry.z or 9000)
+    end, nil)
+    safeCall(function()
+        widget:SetVisibility(0)
+        widget:SetRenderOpacity(1.0)
+        widget:ForceVolatile(true)
+        widget:InvalidateLayoutAndVolatility()
+        widget:SynchronizeProperties()
     end, nil)
     return true
 end
@@ -399,17 +540,37 @@ local function objectPath(object)
 end
 
 local function makeButton(canvas, context, mode, label, geometry)
-    local classPath = RESULT_FLOWS[mode].buttonClass
+    -- The VR Results board reuses the flat SongInfo UMG surface.  Its VR
+    -- keyboard button class is a different world-space control and does not
+    -- paint when inserted into this canvas; use the flat result button asset
+    -- for the mod-owned overlay in both modes.
+    -- The rendered StatsPopup is a UMG surface even in VR. Use the flat
+    -- Results button asset when adding a sibling to its HorizontalBox; the
+    -- VR keyboard button class is a WidgetComponent payload and does not
+    -- paint when inserted into an existing UMG tree.
+    local classPath = RESULT_FLOWS.flat.buttonClass
     log("info", "vote button create begin label=" .. tostring(label))
     local root = createUserWidget(classPath, context)
     log("info", "vote button create done label=" .. tostring(label))
     if not valid(root) then
         return nil
     end
-    local textProperty = mode == "vr" and "ButtonText" or "Text_"
-    local childOk, child = pcall(function()
-        return root:GetPropertyValue(textProperty)
-    end)
+    safeCall(function()
+        root:SetVisibility(0)
+        root:SetRenderOpacity(1.0)
+        root:SetIsEnabled(true)
+    end, nil)
+    local textProperty = "Text_"
+    local child = nil
+    for _, propertyName in ipairs({ "Text_", "Text", "TextBlock", "ButtonText", "TextContent" }) do
+        local candidate = safeCall(function() return root:GetPropertyValue(propertyName) end, nil)
+        if valid(candidate) then
+            textProperty = propertyName
+            child = candidate
+            break
+        end
+    end
+    local childOk = child ~= nil
     local childClass = valid(child) and safeCall(function()
         return child:GetClass():GetFullName()
     end, "unknown") or "nil"
@@ -424,9 +585,17 @@ local function makeButton(canvas, context, mode, label, geometry)
         else
             log("info", "stock Results button labeled before attach label=" .. tostring(label))
         end
+        safeCall(function()
+            -- Keep the arrow and count together inside the restored full-width
+            -- VR button instead of inheriting the stock edge alignment.
+            child:SetJustification(1) -- ETextJustify::Center
+            child:SetVisibility(0)
+            child:SetRenderOpacity(1.0)
+            child:SetIsEnabled(true)
+        end, nil)
     end
     local innerButton = nil
-    for _, propertyName in ipairs({ "Button_64", "Button" }) do
+    for _, propertyName in ipairs({ "Button_64", "Button", "Button_0" }) do
         local candidate = safeCall(function() return root:GetPropertyValue(propertyName) end, nil)
         if valid(candidate) then
             innerButton = candidate
@@ -437,12 +606,19 @@ local function makeButton(canvas, context, mode, label, geometry)
     end
     safeCall(function()
         root:SetRenderTransformPivot({ X = 0.0, Y = 0.0 })
-        -- FlatInGameButton's authored content is approximately 300x70;
-        -- scale it to the 96x42 button bounds.
-        root:SetRenderScale({ X = 0.36, Y = 0.6 })
+        -- FlatInGameButton's authored content is approximately 300x70. VR
+        -- needs a larger hit target and readable label at the Results board's
+        -- world-space scale.
+        root:SetRenderScale({ X = 1.32, Y = 1.58 })
         root:SetRenderOpacity(1.0)
+        if mode == "vr" then
+            -- HorizontalBox siblings are laid out after the fixed-size
+            -- StatsWidget draw surface. Pull them back into its visible band;
+            -- this does not alter any stock slot or child layout.
+            root:SetRenderTransformTranslation({ X = 0.0, Y = 0.0 })
+        end
     end, nil)
-    if not addButtonToCanvas(canvas, root, geometry) then
+    if not addToCanvas(canvas, root, geometry) then
         log("error", "failed to attach Results button widget label=" .. tostring(label))
         return nil
     end
@@ -466,6 +642,10 @@ local function makeButton(canvas, context, mode, label, geometry)
     }
 end
 
+
+
+
+
 local COLORS = {
     normal = { R = 0.82, G = 0.86, B = 0.92, A = 1.0 },
     up = { R = 0.25, G = 1.0, B = 0.42, A = 1.0 },
@@ -478,7 +658,7 @@ local function removeWidgets()
     if widgets ~= nil then
         for _, entry in pairs(widgets) do
             local candidates = type(entry) == "table"
-                and { entry.root, entry.button, entry.text }
+                and { entry.root, entry.button, entry.text, entry.component }
                 or { entry }
             for _, widget in ipairs(candidates) do
                 if valid(widget) then
@@ -487,6 +667,10 @@ local function removeWidgets()
             end
         end
     end
+    if valid(state.vrOverlayComponent) then
+        safeCall(function() state.vrOverlayComponent:DestroyComponent() end, nil)
+    end
+    state.vrOverlayComponent = nil
     state.widgets = nil
     state.panelPath = nil
     state.phase = "hidden"
@@ -505,7 +689,11 @@ local function render()
     -- A failed request is terminal for this panel. Keeping the controls
     -- disabled prevents retries while the timed-out native request may still
     -- be owned by VaRest/UE4SS, which can otherwise crash the game.
-    local enabled = state.phase == "ready"
+    -- Keep the visual hit surfaces enabled while the initial vote request is
+    -- pending or unavailable. FlatInGameButton hides its label in the
+    -- disabled style, which makes VR controls appear absent; hooks still
+    -- reject clicks unless the vote state is ready.
+    local enabled = true
     safeCall(function()
         widgets.up.button:SetIsEnabled(enabled)
         widgets.down.button:SetIsEnabled(enabled)
@@ -669,6 +857,29 @@ local function installButtonHooks()
 end
 
 local function createWidgets(panel, panelPath, mode)
+    -- VR uses a sibling WidgetComponent path below. Never mutate the
+    -- authored SongInfo tree; its layout is stock-owned.
+    -- Results can be discovered during the short transition while the VR
+    -- WidgetComponents are still being registered. Re-probe here, at the
+    -- actual creation point, so a transient flat-panel match cannot route the
+    -- VR board through the non-rendering flat UMG path.
+    if mode ~= "vr" then
+        local vrProbe = findVrStatsComponent()
+        if valid(vrProbe) then
+            mode = "vr"
+            state.statsComponent = vrProbe
+            local songComponent = findVrSongInfoComponent()
+            local songUser = valid(songComponent)
+                and safeCall(function() return songComponent:GetUserWidgetObject() end, nil)
+                or nil
+            if valid(songUser) then
+                panel = songUser
+                panelPath = fullName(songUser)
+                log("info", "late VR Results panel switched to SongInfoWidget user=" .. panelPath)
+            end
+            log("info", "late VR Results detection promoted panel to VR")
+        end
+    end
     local canvas = findVoteCanvas(panel, panelPath, mode)
     if not valid(canvas) then
         if not state.diagnostics.canvasMissing then
@@ -677,18 +888,69 @@ local function createWidgets(panel, panelPath, mode)
         end
         return false
     end
-    local buttonWidth, buttonHeight = 96, 42
-    local voteHeight = 112
+    if mode == "vr" then
+        -- ScoreboardWidget is the rendered parent canvas containing the
+        -- Distance display. Add the vote controls as an overlay child of
+        -- that parent, leaving SongInfo and all authored child slots alone.
+        local source, context, targetCanvas = findVrScoreboardSurface()
+        if not valid(source) or not valid(context) or not valid(targetCanvas) then
+            log("error", "rendered ScoreboardWidget UMG root unavailable for VR vote buttons")
+            return false
+        end
+        log("info", "VR vote target ScoreboardWidget root=" .. fullName(targetCanvas)
+            .. " source=" .. fullName(source))
+        -- The authored Distance panel occupies the left 840x195 band in the
+        -- 1435x667 ScoreboardWidget. Place the two same-width buttons in the
+        -- free band immediately to its right, inside the parent canvas.
+        local up = makeButton(targetCanvas, context, mode, "▲ 0", {
+            x = 1195, y = 453, width = 300, height = 78, z = 9000,
+        })
+        local down = makeButton(targetCanvas, context, mode, "▼ 0", {
+            x = 1195, y = 542, width = 300, height = 78, z = 9001,
+        })
+        if up == nil or down == nil then
+            log("error", "failed to attach VR vote buttons to rendered StatsPopup")
+            return false
+        end
+        state.widgets = { container = nil, status = nil, up = up, down = down }
+        state.panelPath = panelPath
+        state.mode = mode
+        state.phase = "hidden"
+        state.currentVote = nil
+        state.upvotes = 0
+        state.downvotes = 0
+        log("info", "created VR Results vote buttons on ScoreboardWidget root surface")
+        installButtonHooks()
+        loadVote()
+        return true
+    end
+    -- Keep the VR slot at the same authored width as flat.  The compact
+    -- overlay group is positioned/scaled as a whole; the buttons themselves
+    -- must not be narrowed because that clips the vote count visually.
+    local buttonWidth, buttonHeight = 260, 110
+    local voteHeight = 250
     local geometry = {
-        x = 530,
-        y = 17,
-        width = 108,
+        -- Keep the stock SongInfo widget at its native draw size. The badge
+        -- layout is authored relative to that surface; widening the component
+        -- moves the badge vertically in VR. Place the full-width vote group at
+        -- the native right edge instead.
+        -- The independent overlay has a 2400-unit surface. The stock badge
+        -- ends at roughly 1900; put the full-width group in the next band.
+        -- Keep the full-width group inside the native VR surface.  The prior
+        -- x position put its right side beyond the WidgetComponent clip.
+        x = 1900,
+        y = 35,
+        width = 400,
         height = voteHeight,
-        anchorRight = true,
+        anchorRight = false,
     }
-    local container = construct("/Script/UMG.CanvasPanel", canvas)
+    -- Use the UserWidget as the UObject outer; constructing a CanvasPanel with
+    -- the live VR CanvasPanel outer can stall UE4SS on this build.
+    local widgetOuter = panel
+    local container = construct("/Script/UMG.CanvasPanel", widgetOuter)
     log("info", "vote panel construct container begin")
-    if not valid(container) or not addToCanvas(canvas, container, geometry) then
+    local containerAttached = valid(container) and addToCanvas(canvas, container, geometry) or false
+    if not containerAttached then
         if not state.diagnostics.containerFailed then
             state.diagnostics.containerFailed = true
             log("error", "failed to construct or attach standalone Results vote panel")
@@ -697,9 +959,10 @@ local function createWidgets(panel, panelPath, mode)
     end
     log("info", "vote panel construct container done")
     log("info", "vote panel construct up begin")
-    local up = makeButton(container, panel, mode, "▲ 0", { x = 6, y = 7, width = buttonWidth, height = buttonHeight, z = 2 })
+    local buttonContext = panel
+    local up = makeButton(container, buttonContext, mode, "▲ 0", { x = 100, y = 8, width = buttonWidth, height = buttonHeight, z = 2 })
     log("info", "vote panel construct up done")
-    local down = makeButton(container, panel, mode, "▼ 0", { x = 6, y = 63, width = buttonWidth, height = buttonHeight, z = 2 })
+    local down = makeButton(container, buttonContext, mode, "▼ 0", { x = 100, y = 132, width = buttonWidth, height = buttonHeight, z = 2 })
     log("info", "vote panel construct down done")
     if up == nil or down == nil then
         if not state.diagnostics.buttonsFailed then
@@ -725,7 +988,7 @@ local function createWidgets(panel, panelPath, mode)
     state.currentVote = nil
     state.upvotes = 0
     state.downvotes = 0
-    log("info", "created standalone " .. mode .. " Results vote panel")
+    log("info", "created standalone flat Results vote panel")
     installButtonHooks()
     loadVote()
     return true
