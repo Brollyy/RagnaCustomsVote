@@ -589,6 +589,11 @@ local function makeButton(canvas, context, mode, label, geometry)
             -- Keep the arrow and count together inside the restored full-width
             -- VR button instead of inheriting the stock edge alignment.
             child:SetJustification(1) -- ETextJustify::Center
+            -- The stock label can retain its authored slot alignment when the
+            -- button is re-used on the Results canvas. Explicitly center both
+            -- axes so the label stays centered in the full button surface.
+            child:SetHorizontalAlignment(2) -- EHorizontalAlignment::HAlign_Center
+            child:SetVerticalAlignment(2) -- EVerticalAlignment::VAlign_Center
             child:SetVisibility(0)
             child:SetRenderOpacity(1.0)
             child:SetIsEnabled(true)
