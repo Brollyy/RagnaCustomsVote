@@ -132,6 +132,9 @@ local RESULT_FLOWS = {
         panelClasses = { "FlatInGameEndPanel_C" },
         buttonClass = "/Game/Flat/Blueprints/UI/InGame/FlatInGameButton.FlatInGameButton_C",
     },
+    vr = {
+        buttonClass = "/Game/Flat/Blueprints/UI/InGame/FlatInGameButton.FlatInGameButton_C",
+    },
 }
 
 local function findResultsPanelForFlow(flow)
@@ -448,7 +451,7 @@ local function objectPath(object)
 end
 
 local function makeButton(canvas, context, mode, label, geometry)
-    local classPath = RESULT_FLOWS.flat.buttonClass
+    local classPath = RESULT_FLOWS[mode].buttonClass
     log("info", "vote button create begin label=" .. tostring(label))
     local root = createUserWidget(classPath, context)
     log("info", "vote button create done label=" .. tostring(label))
@@ -460,17 +463,7 @@ local function makeButton(canvas, context, mode, label, geometry)
         root:SetRenderOpacity(1.0)
         root:SetIsEnabled(true)
     end, nil)
-    local textProperty = "Text_"
-    local child = nil
-    for _, propertyName in ipairs({ "Text_", "Text", "TextBlock", "ButtonText", "TextContent" }) do
-        local candidate = safeCall(function() return root:GetPropertyValue(propertyName) end, nil)
-        if valid(candidate) then
-            textProperty = propertyName
-            child = candidate
-            break
-        end
-    end
-    local childOk = child ~= nil
+    local child = safeCall(function() return root:GetPropertyValue("Text_") end, nil)
     local childClass = valid(child) and safeCall(function()
         return child:GetClass():GetFullName()
     end, "unknown") or "nil"
@@ -494,15 +487,9 @@ local function makeButton(canvas, context, mode, label, geometry)
             child:SetIsEnabled(true)
         end, nil)
     end
-    local innerButton = nil
-    for _, propertyName in ipairs({ "Button_64", "Button", "Button_0" }) do
-        local candidate = safeCall(function() return root:GetPropertyValue(propertyName) end, nil)
-        if valid(candidate) then
-            innerButton = candidate
-            log("info", "vote button inner target property=" .. propertyName
-                .. " path=" .. objectPath(candidate))
-            break
-        end
+    local innerButton = safeCall(function() return root:GetPropertyValue("Button_64") end, nil)
+    if valid(innerButton) then
+        log("info", "vote button inner target property=Button_64 path=" .. objectPath(innerButton))
     end
     safeCall(function()
         root:SetRenderTransformPivot({ X = 0.0, Y = 0.0 })
@@ -544,10 +531,13 @@ local function makeButton(canvas, context, mode, label, geometry)
     }
 end
 
+local function makeFlatButton(canvas, context, label, geometry)
+    return makeButton(canvas, context, "flat", label, geometry)
+end
 
-
-
-
+local function makeVrButton(canvas, context, label, geometry)
+    return makeButton(canvas, context, "vr", label, geometry)
+end
 local COLORS = {
     normal = { R = 0.82, G = 0.86, B = 0.92, A = 1.0 },
     up = { R = 0.25, G = 1.0, B = 0.42, A = 1.0 },
@@ -588,14 +578,7 @@ local function render()
     local downColor = state.currentVote == "down" and COLORS.down or COLORS.normal
     safeCall(function() widgets.up.button:SetColorAndOpacity(upColor) end, nil)
     safeCall(function() widgets.down.button:SetColorAndOpacity(downColor) end, nil)
-    -- A failed request is terminal for this panel. Keeping the controls
-    -- disabled prevents retries while the timed-out native request may still
-    -- be owned by VaRest/UE4SS, which can otherwise crash the game.
-    -- Keep the visual hit surfaces enabled while the initial vote request is
-    -- pending or unavailable. FlatInGameButton hides its label in the
-    -- disabled style, which makes VR controls appear absent; hooks still
-    -- reject clicks unless the vote state is ready.
-    local enabled = true
+    local enabled = state.phase == "ready"
     safeCall(function()
         widgets.up.button:SetIsEnabled(enabled)
         widgets.down.button:SetIsEnabled(enabled)
@@ -764,10 +747,10 @@ local function createVrWidgets(panelPath)
         log("error", "rendered ScoreboardWidget UMG root unavailable for VR vote buttons")
         return false
     end
-    local up = makeButton(targetCanvas, context, "vr", "▲ 0", {
+    local up = makeVrButton(targetCanvas, context, "▲ 0", {
         x = 1195, y = 453, width = 300, height = 78, z = 9000,
     })
-    local down = makeButton(targetCanvas, context, "vr", "▼ 0", {
+    local down = makeVrButton(targetCanvas, context, "▼ 0", {
         x = 1195, y = 542, width = 300, height = 78, z = 9001,
     })
     if up == nil or down == nil then
@@ -796,20 +779,9 @@ local function createFlatWidgets(panel, panelPath)
         end
         return false
     end
-    -- Keep the VR slot at the same authored width as flat.  The compact
-    -- overlay group is positioned/scaled as a whole; the buttons themselves
-    -- must not be narrowed because that clips the vote count visually.
     local buttonWidth, buttonHeight = 96, 42
     local voteHeight = 112
     local geometry = {
-        -- Keep the stock SongInfo widget at its native draw size. The badge
-        -- layout is authored relative to that surface; widening the component
-        -- moves the badge vertically in VR. Place the full-width vote group at
-        -- the native right edge instead.
-        -- The independent overlay has a 2400-unit surface. The stock badge
-        -- ends at roughly 1900; put the full-width group in the next band.
-        -- Keep the full-width group inside the native VR surface.  The prior
-        -- x position put its right side beyond the WidgetComponent clip.
         x = 530,
         y = 17,
         width = 108,
@@ -832,9 +804,9 @@ local function createFlatWidgets(panel, panelPath)
     log("info", "vote panel construct container done")
     log("info", "vote panel construct up begin")
     local buttonContext = panel
-    local up = makeButton(container, buttonContext, "flat", "▲ 0", { x = 6, y = 7, width = buttonWidth, height = buttonHeight, z = 2 })
+    local up = makeFlatButton(container, buttonContext, "▲ 0", { x = 6, y = 7, width = buttonWidth, height = buttonHeight, z = 2 })
     log("info", "vote panel construct up done")
-    local down = makeButton(container, buttonContext, "flat", "▼ 0", { x = 6, y = 63, width = buttonWidth, height = buttonHeight, z = 2 })
+    local down = makeFlatButton(container, buttonContext, "▼ 0", { x = 6, y = 63, width = buttonWidth, height = buttonHeight, z = 2 })
     log("info", "vote panel construct down done")
     if up == nil or down == nil then
         if not state.diagnostics.buttonsFailed then
