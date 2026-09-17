@@ -382,6 +382,20 @@ local function addToCanvas(canvas, widget, geometry)
     return true
 end
 
+local function addButtonToCanvas(canvas, widget, geometry)
+    local slot = safeCall(function()
+        return canvas:AddChildToCanvas(widget)
+    end, nil)
+    if not valid(slot) then return false end
+    safeCall(function()
+        slot:SetAutoSize(false)
+        slot:SetPosition({ X = geometry.x, Y = geometry.y })
+        slot:SetSize({ X = geometry.width, Y = geometry.height })
+        slot:SetZOrder(geometry.z or 9000)
+    end, nil)
+    return true
+end
+
 local function findPlayerController(context)
     local controller = nil
     if type(UEHelpers) == "table" and type(UEHelpers.GetPlayerController) == "function" then
@@ -433,7 +447,7 @@ local function objectPath(object)
     return name:match("^[^ ]+ (.+)$") or name
 end
 
-local function makeButton(canvas, context, label, geometry)
+local function makeButton(canvas, context, mode, label, geometry)
     local classPath = RESULT_FLOWS.flat.buttonClass
     log("info", "vote button create begin label=" .. tostring(label))
     local root = createUserWidget(classPath, context)
@@ -495,11 +509,18 @@ local function makeButton(canvas, context, label, geometry)
         -- FlatInGameButton's authored content is approximately 300x70. VR
         -- needs a larger hit target and readable label at the Results board's
         -- world-space scale.
-        root:SetRenderScale({ X = 1.32, Y = 1.58 })
+        if mode == "flat" then
+            root:SetRenderScale({ X = 0.36, Y = 0.6 })
+        else
+            root:SetRenderScale({ X = 1.32, Y = 1.58 })
+        end
         root:SetRenderOpacity(1.0)
         root:SetRenderTransformTranslation({ X = 0.0, Y = 0.0 })
     end, nil)
-    if not addToCanvas(canvas, root, geometry) then
+    local attached = mode == "flat"
+        and addButtonToCanvas(canvas, root, geometry)
+        or addToCanvas(canvas, root, geometry)
+    if not attached then
         log("error", "failed to attach Results button widget label=" .. tostring(label))
         return nil
     end
@@ -743,10 +764,10 @@ local function createVrWidgets(panelPath)
         log("error", "rendered ScoreboardWidget UMG root unavailable for VR vote buttons")
         return false
     end
-    local up = makeButton(targetCanvas, context, "▲ 0", {
+    local up = makeButton(targetCanvas, context, "vr", "▲ 0", {
         x = 1195, y = 453, width = 300, height = 78, z = 9000,
     })
-    local down = makeButton(targetCanvas, context, "▼ 0", {
+    local down = makeButton(targetCanvas, context, "vr", "▼ 0", {
         x = 1195, y = 542, width = 300, height = 78, z = 9001,
     })
     if up == nil or down == nil then
@@ -778,8 +799,8 @@ local function createFlatWidgets(panel, panelPath)
     -- Keep the VR slot at the same authored width as flat.  The compact
     -- overlay group is positioned/scaled as a whole; the buttons themselves
     -- must not be narrowed because that clips the vote count visually.
-    local buttonWidth, buttonHeight = 260, 110
-    local voteHeight = 250
+    local buttonWidth, buttonHeight = 96, 42
+    local voteHeight = 112
     local geometry = {
         -- Keep the stock SongInfo widget at its native draw size. The badge
         -- layout is authored relative to that surface; widening the component
@@ -789,11 +810,11 @@ local function createFlatWidgets(panel, panelPath)
         -- ends at roughly 1900; put the full-width group in the next band.
         -- Keep the full-width group inside the native VR surface.  The prior
         -- x position put its right side beyond the WidgetComponent clip.
-        x = 1900,
-        y = 35,
-        width = 400,
+        x = 530,
+        y = 17,
+        width = 108,
         height = voteHeight,
-        anchorRight = false,
+        anchorRight = true,
     }
     -- Use the UserWidget as the UObject outer; constructing a CanvasPanel with
     -- the live VR CanvasPanel outer can stall UE4SS on this build.
@@ -811,9 +832,9 @@ local function createFlatWidgets(panel, panelPath)
     log("info", "vote panel construct container done")
     log("info", "vote panel construct up begin")
     local buttonContext = panel
-    local up = makeButton(container, buttonContext, "▲ 0", { x = 100, y = 8, width = buttonWidth, height = buttonHeight, z = 2 })
+    local up = makeButton(container, buttonContext, "flat", "▲ 0", { x = 6, y = 7, width = buttonWidth, height = buttonHeight, z = 2 })
     log("info", "vote panel construct up done")
-    local down = makeButton(container, buttonContext, "▼ 0", { x = 100, y = 132, width = buttonWidth, height = buttonHeight, z = 2 })
+    local down = makeButton(container, buttonContext, "flat", "▼ 0", { x = 6, y = 63, width = buttonWidth, height = buttonHeight, z = 2 })
     log("info", "vote panel construct down done")
     if up == nil or down == nil then
         if not state.diagnostics.buttonsFailed then
