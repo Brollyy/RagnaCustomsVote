@@ -355,8 +355,6 @@ local function addToCanvas(canvas, widget, geometry)
     local slot = safeCall(function()
         return canvas:AddChildToCanvas(widget)
     end, nil)
-    -- VR StatsWidget has a HorizontalBox root. Append the mod-owned canvas to
-    -- that root so stock Distance/stat children keep their layout.
     if not valid(slot) then
         slot = safeCall(function()
             return canvas:AddChild(widget)
@@ -543,6 +541,20 @@ end
 local function makeVrButton(canvas, context, label, geometry)
     return makeButton(canvas, context, "vr", label, geometry)
 end
+
+local function createVoteButtons(canvas, context, mode, entries)
+    local make = mode == "vr" and makeVrButton or makeFlatButton
+    local widgets = {}
+    for _, entry in ipairs(entries) do
+        local widget = make(canvas, context, entry.label, entry.geometry)
+        if widget == nil then
+            return nil
+        end
+        widgets[entry.direction] = widget
+    end
+    return widgets
+end
+
 local COLORS = {
     normal = { R = 0.82, G = 0.86, B = 0.92, A = 1.0 },
     up = { R = 0.25, G = 1.0, B = 0.42, A = 1.0 },
@@ -752,17 +764,15 @@ local function createVrWidgets(panelPath)
         log("error", "rendered ScoreboardWidget UMG root unavailable for VR vote buttons")
         return false
     end
-    local up = makeVrButton(targetCanvas, context, "▲ 0", {
-        x = 1195, y = 453, width = 300, height = 78, z = 9000,
+    local buttons = createVoteButtons(targetCanvas, context, "vr", {
+        { direction = "up", label = "▲ 0", geometry = { x = 1195, y = 453, width = 300, height = 78, z = 9000 } },
+        { direction = "down", label = "▼ 0", geometry = { x = 1195, y = 542, width = 300, height = 78, z = 9001 } },
     })
-    local down = makeVrButton(targetCanvas, context, "▼ 0", {
-        x = 1195, y = 542, width = 300, height = 78, z = 9001,
-    })
-    if up == nil or down == nil then
+    if buttons == nil then
         log("error", "failed to attach VR vote buttons to ScoreboardWidget")
         return false
     end
-    state.widgets = { container = nil, status = nil, up = up, down = down }
+    state.widgets = { container = nil, status = nil, up = buttons.up, down = buttons.down }
     state.panelPath = panelPath
     state.mode = "vr"
     state.phase = "hidden"
@@ -809,11 +819,13 @@ local function createFlatWidgets(panel, panelPath)
     log("info", "vote panel construct container done")
     log("info", "vote panel construct up begin")
     local buttonContext = panel
-    local up = makeFlatButton(container, buttonContext, "▲ 0", { x = 6, y = 7, width = buttonWidth, height = buttonHeight, z = 2 })
+    local buttons = createVoteButtons(container, buttonContext, "flat", {
+        { direction = "up", label = "▲ 0", geometry = { x = 6, y = 7, width = buttonWidth, height = buttonHeight, z = 2 } },
+        { direction = "down", label = "▼ 0", geometry = { x = 6, y = 63, width = buttonWidth, height = buttonHeight, z = 2 } },
+    })
     log("info", "vote panel construct up done")
-    local down = makeFlatButton(container, buttonContext, "▼ 0", { x = 6, y = 63, width = buttonWidth, height = buttonHeight, z = 2 })
     log("info", "vote panel construct down done")
-    if up == nil or down == nil then
+    if buttons == nil then
         if not state.diagnostics.buttonsFailed then
             state.diagnostics.buttonsFailed = true
             log("error", "failed to construct or attach Results vote buttons")
@@ -828,8 +840,8 @@ local function createFlatWidgets(panel, panelPath)
     state.widgets = {
         container = container,
         status = nil,
-        up = up,
-        down = down,
+        up = buttons.up,
+        down = buttons.down,
     }
     state.panelPath = panelPath
     state.mode = "flat"
