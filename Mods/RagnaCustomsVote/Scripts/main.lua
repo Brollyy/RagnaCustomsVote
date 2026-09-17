@@ -162,22 +162,16 @@ local function findFlatResultsPanel()
     return nil
 end
 
-local function findActiveResultsPanel()
-    if type(FindFirstOf) ~= "function" then
+local function findVrResultsPanel()
+    if type(FindAllOf) ~= "function" then
         return nil
     end
-    if type(FindAllOf) == "function" then
+    -- The visible VR Results board is rendered by one of these live widget
+    -- components. Return its UserWidget as the flow anchor; the scoreboard
+    -- surface helper performs the component-specific attachment later.
+    for _, componentName in ipairs({ ".SongInfoWidget", ".ScoreboardWidget" }) do
         for _, component in ipairs(safeCall(function() return FindAllOf("WidgetComponent") end, {}) or {}) do
-            if valid(component) and fullName(component):find(".SongInfoWidget", 1, true) ~= nil then
-                local widget = safeCall(function() return component:GetUserWidgetObject() end, nil)
-                if valid(widget) then
-                    local widgetPath = fullName(widget)
-                    return widget, widgetPath, "vr"
-                end
-            end
-        end
-        for _, component in ipairs(safeCall(function() return FindAllOf("WidgetComponent") end, {}) or {}) do
-            if valid(component) and fullName(component):find(".ScoreboardWidget", 1, true) ~= nil then
+            if valid(component) and fullName(component):find(componentName, 1, true) ~= nil then
                 local widget = safeCall(function() return component:GetUserWidgetObject() end, nil)
                 if valid(widget) then
                     return widget, fullName(widget), "vr"
@@ -185,7 +179,18 @@ local function findActiveResultsPanel()
             end
         end
     end
-    local panel, name, mode = findFlatResultsPanel()
+    return nil
+end
+
+local function findActiveResultsPanel()
+    if type(FindFirstOf) ~= "function" then
+        return nil
+    end
+    local panel, name, mode = findVrResultsPanel()
+    if panel ~= nil then
+        return panel, name, mode
+    end
+    panel, name, mode = findFlatResultsPanel()
     if panel ~= nil then
         return panel, name, mode
     end
