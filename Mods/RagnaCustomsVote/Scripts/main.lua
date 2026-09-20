@@ -11,7 +11,11 @@ local function log(level, message)
 end
 
 local function loadApiDependency()
-    if type(Api) == "table" and type(Api.getWanApiVote) == "function" and type(Api.setWanApiVote) == "function" then
+    if type(Api) == "table"
+        and type(Api.getSongVote) == "function"
+        and type(Api.upvote) == "function"
+        and type(Api.downvote) == "function"
+        and type(Api.on) == "function" then
         return Api
     end
 
@@ -32,18 +36,23 @@ local function loadApiDependency()
 end
 
 Api = loadApiDependency()
-if type(Api) ~= "table" or type(Api.getWanApiVote) ~= "function" or type(Api.setWanApiVote) ~= "function" then
-    log("error", "RagnaCustomsApi >= 0.2.0 is required")
+if type(Api) ~= "table"
+    or type(Api.getSongVote) ~= "function"
+    or type(Api.upvote) ~= "function"
+    or type(Api.downvote) ~= "function"
+    or type(Api.on) ~= "function" then
+    log("error", "RagnaCustomsApi >= 0.3.0 is required")
     return
 end
 
--- This consumer explicitly opts into Ragnarock's canonical WanApi contract.
-Api.configure({ useWanApi = true })
+-- The 0.3 API uses its documented catalog transport and numeric song IDs.
+Api.configure({ preferApi = true, transport = "varest" })
 
 local state = _G.__ragnaCustomsVoteState or {
     hooksInstalled = false,
     buttonHooksInstalled = false,
     beatmap = nil,
+    songId = nil,
     custom = nil,
     panelPath = nil,
     mode = nil,
@@ -57,6 +66,7 @@ local state = _G.__ragnaCustomsVoteState or {
     createFailedPath = nil,
     error = nil,
     pressed = { up = false, down = false },
+    apiEventsInstalled = false,
 }
 _G.__ragnaCustomsVoteState = state
 state.diagnostics = state.diagnostics or {}
@@ -582,6 +592,7 @@ local function removeWidgets()
     state.vrOverlayComponent = nil
     state.widgets = nil
     state.panelPath = nil
+    state.loadedSongId = nil
     state.phase = "hidden"
     state.pressed = { up = false, down = false }
 end
@@ -660,12 +671,66 @@ local function applyResponse(result)
     end
 end
 
+local function jsonNumberField(body, name)
+    return tonumber(tostring(body or ""):match('"' .. name .. '"%s*:%s*(-?%d+%.?%d*)'))
+end
+
+local function jsonStringField(body, name)
+    local value = tostring(body or ""):match('"' .. name .. '"%s*:%s*"([^"]*)"')
+    if value == nil and tostring(body or ""):match('"' .. name .. '"%s*:%s*null') ~= nil then
+        return nil
+    end
+    return value
+end
+
+local function apiVoteResult(responseBody, error)
+    if error ~= nil then
+        return { ok = false, error = error }
+    end
+    local body = type(responseBody) == "table" and responseBody.body or responseBody
+    local upvotes = jsonNumberField(body, "upvotes")
+    local downvotes = jsonNumberField(body, "downvotes")
+    if upvotes == nil or downvotes == nil then
+        return { ok = false, error = { code = "invalid_response", message = "vote response is missing counts" } }
+    end
+    local currentVote = jsonStringField(body, "currentVote")
+    if currentVote ~= nil and currentVote ~= "up" and currentVote ~= "down" then
+        return { ok = false, error = { code = "invalid_response", message = "vote response contains an invalid selection" } }
+    end
+    return {
+        ok = true,
+        state = { currentVote = currentVote, upvotes = upvotes, downvotes = downvotes },
+    }
+end
+
+local function installApiEventHandlers()
+    if state.apiEventsInstalled then return end
+    state.apiEventsInstalled = true
+    Api.on("vote.details.completed", function(payload)
+        if payload == nil or tostring(payload.id) ~= tostring(state.songId) then return end
+        applyResponse(apiVoteResult(payload.response, nil))
+    end)
+    Api.on("vote.details.failed", function(payload)
+        if payload == nil or tostring(payload.id) ~= tostring(state.songId) then return end
+        applyResponse(apiVoteResult(nil, payload.error))
+    end)
+    Api.on("vote.completed", function(payload)
+        if payload == nil or tostring(payload.id) ~= tostring(state.songId) then return end
+        applyResponse(apiVoteResult(payload.response, nil))
+    end)
+    Api.on("vote.failed", function(payload)
+        if payload == nil or tostring(payload.id) ~= tostring(state.songId) then return end
+        applyResponse(apiVoteResult(nil, payload.error))
+    end)
+end
+
 local function loadVote()
     state.phase = "loading"
     render()
-    local _, err = Api.getWanApiVote(state.beatmap, applyResponse)
+    installApiEventHandlers()
+    local _, err = Api.getSongVote(state.songId)
     if err ~= nil then
-        applyResponse({ ok = false, error = { code = "start_failed", message = err } })
+        applyResponse(apiVoteResult(nil, { code = "start_failed", message = err }))
     end
 end
 
@@ -674,16 +739,19 @@ local function submit(direction)
         return
     end
     local desired = direction
-    if state.currentVote == direction then
-        desired = nil
-    end
     log("info", "vote submit current=" .. tostring(state.currentVote)
         .. " requested=" .. tostring(direction) .. " desired=" .. tostring(desired))
     state.phase = "submitting"
     render()
-    local _, err = Api.setWanApiVote(state.beatmap, desired, applyResponse)
+    installApiEventHandlers()
+    local _, err
+    if desired == "up" then
+        _, err = Api.upvote(state.songId)
+    else
+        _, err = Api.downvote(state.songId)
+    end
     if err ~= nil then
-        applyResponse({ ok = false, error = { code = "start_failed", message = err } })
+        applyResponse(apiVoteResult(nil, { code = "start_failed", message = err }))
     end
 end
 
@@ -781,6 +849,7 @@ local function createVrWidgets(panelPath)
     state.downvotes = 0
     log("info", "created VR Results vote buttons on ScoreboardWidget root surface")
     installButtonHooks()
+    state.loadedSongId = state.songId
     loadVote()
     return true
 end
@@ -851,6 +920,7 @@ local function createFlatWidgets(panel, panelPath)
     state.downvotes = 0
     log("info", "created standalone flat Results vote panel")
     installButtonHooks()
+    state.loadedSongId = state.songId
     loadVote()
     return true
 end
@@ -931,6 +1001,41 @@ local function findPlayedSongManager()
     return nil
 end
 
+local function extractSongId(value)
+    value = unwrap(value)
+    if value == nil then return nil end
+    local numeric = tonumber(value)
+    if numeric ~= nil and numeric > 0 then
+        return math.floor(numeric)
+    end
+    local text = tostring(value)
+    local id = text:match("ragnac://install/(%d+)")
+        or text:match("/songs/[^/]+/(%d+)")
+        or text:match("/song/(%d+)")
+        or text:match("[%W_]id[%W_]*(%d+)")
+    return id and tonumber(id) or nil
+end
+
+local function songIdFromObject(song)
+    if song == nil then return nil end
+    for _, accessor in ipairs({
+        function() return song:GetSongId() end,
+        function() return song:GetId() end,
+        function() return song.SongId end,
+        function() return song.Id end,
+        function() return song.m_songId end,
+        function() return song.m_id end,
+        function() return song:GetCompositeId() end,
+        function() return song.CompositeId end,
+        function() return song.m_compositeId end,
+    }) do
+        local candidate = safeCall(accessor, nil)
+        local id = extractSongId(candidate)
+        if id ~= nil then return id end
+    end
+    return extractSongId(fullName(song))
+end
+
 local function resolvePlayedSongState(manager)
     if not valid(manager) then
         return false
@@ -948,6 +1053,7 @@ local function resolvePlayedSongState(manager)
     local rawCustom = song and safeCall(function()
         return song:IsCustom()
     end, nil) or nil
+    state.songId = songIdFromObject(song) or state.songId
     local custom = extractBoolean(rawCustom)
     if custom ~= nil then
         state.custom = custom
@@ -958,11 +1064,11 @@ local function resolvePlayedSongState(manager)
             return true
         end, false)
     end
-    if state.custom ~= nil and state.beatmap ~= nil then
+    if state.custom ~= nil and state.beatmap ~= nil and state.songId ~= nil then
         if not state.diagnostics.playedSongResolved then
             state.diagnostics.playedSongResolved = true
             log("info", "resolved played song from BeatManager custom=" .. tostring(state.custom)
-                .. " beatmap=" .. state.beatmap)
+                .. " beatmap=" .. state.beatmap .. " songId=" .. tostring(state.songId))
         end
         return true
     end
@@ -1004,6 +1110,9 @@ local function installHooks()
         local hash = extractHash(...)
         if hash ~= nil then
             state.beatmap = hash
+        end
+        for index = 1, select("#", ...) do
+            state.songId = extractSongId(select(index, ...)) or state.songId
         end
     end
     local customPost = function(...)
@@ -1074,10 +1183,12 @@ local function poll()
         state.lastLoggedCustomScoresAllowed = state.customScoresAllowed
         log("info", "custom score sending allowed=" .. tostring(state.customScoresAllowed))
     end
-    if panel == nil or state.custom ~= true or state.beatmap == nil or state.customScoresAllowed ~= true then
+    if panel == nil or state.custom ~= true or state.beatmap == nil
+        or state.songId == nil or state.customScoresAllowed ~= true then
         local reason = panel == nil and "no_results_panel"
             or state.custom ~= true and "song_not_custom"
             or state.beatmap == nil and "beatmap_unresolved"
+            or state.songId == nil and "song_id_unresolved"
             or "custom_score_sending_disabled"
         if reason ~= state.lastSuppressionReason then
             state.lastSuppressionReason = reason
@@ -1099,7 +1210,7 @@ local function poll()
     if state.createFailedPath == path then
         return
     end
-    if state.widgets == nil or state.panelPath ~= path then
+    if state.widgets == nil or state.panelPath ~= path or state.loadedSongId ~= state.songId then
         if state.createQueued then
             return
         end
