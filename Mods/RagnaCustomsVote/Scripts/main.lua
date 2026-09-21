@@ -1008,10 +1008,12 @@ local function extractSongId(value)
     if numeric ~= nil and numeric > 0 then
         return math.floor(numeric)
     end
-    local text = tostring(value)
+    local text = tostring(value):gsub("\\", "/")
     local id = text:match("ragnac://install/(%d+)")
         or text:match("/songs/[^/]+/(%d+)")
         or text:match("/song/(%d+)")
+        or text:match("/CustomSongs/(%d+)")
+        or text:match("/(%d+)/?$")
         or text:match("[%W_]id[%W_]*(%d+)")
     return id and tonumber(id) or nil
 end
@@ -1020,20 +1022,48 @@ local function songIdFromObject(song)
     if song == nil then return nil end
     for _, accessor in ipairs({
         function() return song:GetSongId() end,
+        function() return song:GetSongID() end,
         function() return song:GetId() end,
+        function() return song:GetID() end,
+        function() return song:GetCustomSongId() end,
+        function() return song:GetCustomSongID() end,
         function() return song.SongId end,
+        function() return song.SongID end,
         function() return song.Id end,
+        function() return song.ID end,
         function() return song.m_songId end,
+        function() return song.m_songID end,
+        function() return song.CustomSongId end,
+        function() return song.CustomSongID end,
         function() return song.m_id end,
         function() return song:GetCompositeId() end,
+        function() return song:GetCompositeID() end,
         function() return song.CompositeId end,
+        function() return song.CompositeID end,
         function() return song.m_compositeId end,
+        function() return song.m_compositeID end,
+        function() return song:GetPath() end,
+        function() return song.Path end,
+        function() return song.FolderPath end,
+        function() return song.m_folderPath end,
+        function() return song:GetPropertyValue("SongId") end,
+        function() return song:GetPropertyValue("SongID") end,
+        function() return song:GetPropertyValue("Id") end,
+        function() return song:GetPropertyValue("ID") end,
     }) do
         local candidate = safeCall(accessor, nil)
         local id = extractSongId(candidate)
         if id ~= nil then return id end
     end
     return extractSongId(fullName(song))
+end
+
+local function installedSongId(hash)
+    if hash == nil or type(Api.getInstalledSong) ~= "function" then return nil end
+    local installed = safeCall(function()
+        return Api.getInstalledSong(hash)
+    end, nil)
+    return installed and extractSongId(installed.id or installed.path) or nil
 end
 
 local function resolvePlayedSongState(manager)
@@ -1053,7 +1083,10 @@ local function resolvePlayedSongState(manager)
     local rawCustom = song and safeCall(function()
         return song:IsCustom()
     end, nil) or nil
-    state.songId = songIdFromObject(song) or state.songId
+    state.songId = songIdFromObject(song)
+        or songIdFromObject(beatMap)
+        or installedSongId(state.beatmap)
+        or state.songId
     local custom = extractBoolean(rawCustom)
     if custom ~= nil then
         state.custom = custom
@@ -1129,9 +1162,10 @@ local function installHooks()
     installHook("/Script/Ragnarock.BeatMap:GetHash", function() end, hashPost)
 end
 
-_G.RagnaCustomsVoteSetBeatmapHash = function(hash, isCustom)
+_G.RagnaCustomsVoteSetBeatmapHash = function(hash, isCustom, songId)
     state.beatmap = hash and extractHash(hash) or nil
     state.custom = isCustom == true
+    state.songId = extractSongId(songId) or installedSongId(state.beatmap)
 end
 
 local function poll()
