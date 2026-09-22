@@ -531,9 +531,7 @@ local function makeButton(canvas, context, mode, label, geometry)
         root:SetRenderOpacity(1.0)
         root:SetRenderTransformTranslation({ X = 0.0, Y = 0.0 })
     end, nil)
-    local attached = mode == "flat"
-        and addButtonToCanvas(canvas, root, geometry)
-        or addToCanvas(canvas, root, geometry)
+    local attached = addToCanvas(canvas, root, geometry)
     if not attached then
         log("error", "failed to attach Results button widget label=" .. tostring(label))
         return nil
@@ -865,33 +863,14 @@ local function createFlatWidgets(panel, panelPath)
         return false
     end
     local buttonWidth, buttonHeight = 96, 42
-    local voteHeight = 112
-    local geometry = {
-        x = 530,
-        y = 17,
-        width = 108,
-        height = voteHeight,
-        anchorRight = true,
-    }
-    -- Use the UserWidget as the UObject outer; constructing a CanvasPanel with
-    -- the live VR CanvasPanel outer can stall UE4SS on this build.
-    local widgetOuter = panel
-    local container = construct("/Script/UMG.CanvasPanel", widgetOuter)
-    log("info", "vote panel construct container begin")
-    local containerAttached = valid(container) and addToCanvas(canvas, container, geometry) or false
-    if not containerAttached then
-        if not state.diagnostics.containerFailed then
-            state.diagnostics.containerFailed = true
-            log("error", "failed to construct or attach standalone Results vote panel")
-        end
-        return false
-    end
-    log("info", "vote panel construct container done")
+    -- Attach the owned buttons directly to the existing SongInfo surface.
+    -- Creating an intermediate CanvasPanel and adding it to this live tree can
+    -- stall UE4SS on the current build.
     log("info", "vote panel construct up begin")
     local buttonContext = panel
-    local buttons = createVoteButtons(container, buttonContext, "flat", {
-        { direction = "up", label = "▲ 0", geometry = { x = 6, y = 7, width = buttonWidth, height = buttonHeight, z = 2 } },
-        { direction = "down", label = "▼ 0", geometry = { x = 6, y = 63, width = buttonWidth, height = buttonHeight, z = 2 } },
+    local buttons = createVoteButtons(canvas, buttonContext, "flat", {
+        { direction = "up", label = "▲ 0", geometry = { x = 530, y = 24, width = buttonWidth, height = buttonHeight, z = 9000 } },
+        { direction = "down", label = "▼ 0", geometry = { x = 530, y = 80, width = buttonWidth, height = buttonHeight, z = 9001 } },
     })
     log("info", "vote panel construct up done")
     log("info", "vote panel construct down done")
@@ -900,15 +879,14 @@ local function createFlatWidgets(panel, panelPath)
             state.diagnostics.buttonsFailed = true
             log("error", "failed to construct or attach Results vote buttons")
         end
-        safeCall(function() if valid(container) then container:RemoveFromParent() end end, nil)
         return false
     end
     safeCall(function()
-        up.button:SetIsEnabled(false)
-        down.button:SetIsEnabled(false)
+        buttons.up.button:SetIsEnabled(false)
+        buttons.down.button:SetIsEnabled(false)
     end, nil)
     state.widgets = {
-        container = container,
+        container = nil,
         status = nil,
         up = buttons.up,
         down = buttons.down,
