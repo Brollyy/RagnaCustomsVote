@@ -17,6 +17,7 @@ local function loadApiDependency()
         and type(Api.downvote) == "function"
         and type(Api.readInstalledSongId) == "function"
         and type(Api.writeInstalledSongId) == "function"
+        and type(Api.discoverInstalledSongId) == "function"
         and type(Api.search) == "function"
         and type(Api.getSong) == "function"
         and type(Api.on) == "function" then
@@ -46,6 +47,7 @@ if type(Api) ~= "table"
     or type(Api.downvote) ~= "function"
     or type(Api.readInstalledSongId) ~= "function"
     or type(Api.writeInstalledSongId) ~= "function"
+    or type(Api.discoverInstalledSongId) ~= "function"
     or type(Api.search) ~= "function"
     or type(Api.getSong) ~= "function"
     or type(Api.on) ~= "function" then
@@ -112,34 +114,6 @@ local function valid(object)
     return safeCall(function()
         return object:IsValid()
     end, true)
-end
-
-local function runtimeSongFolder()
-    if os ~= nil and type(os.getenv) == "function" then
-        local testFolder = os.getenv("RAGNA_TEST_SONG_FOLDER")
-        if testFolder ~= nil and testFolder ~= "" then
-            return testFolder
-        end
-    end
-    local folder = type(Api.resolveSongFolder) == "function"
-        and safeCall(function() return Api.resolveSongFolder() end, nil) or nil
-    if folder ~= nil and folder ~= "" then
-        return folder
-    end
-    if type(Api.getRuntimePaths) ~= "function" then
-        return nil
-    end
-    local paths = safeCall(function() return Api.getRuntimePaths() end, nil)
-    local gameDir = paths and paths.gameDir or nil
-    if gameDir == nil or gameDir == "" then
-        return nil
-    end
-    local normalized = tostring(gameDir):gsub("\\", "/"):gsub("/+$", "")
-    local steamRoot = normalized:match("^(.*)/steamapps/common/Ragnarock$")
-    if steamRoot ~= nil then
-        return steamRoot .. "/steamapps/compatdata/1345820/pfx/drive_c/users/steamuser/Documents/Ragnarock/CustomSongs"
-    end
-    return normalized .. "/CustomSongs"
 end
 
 local function fullName(object)
@@ -1151,7 +1125,7 @@ local function loadedSongFolder(object)
     }
     if object ~= nil and not state.diagnostics.pathFunctionProbe then
         state.diagnostics.pathFunctionProbe = true
-        local getterNames = { "GetPath", "GetFileName" }
+        local getterNames = { "GetPath" }
         for _, getterName in ipairs(getterNames) do
             local raw = safeCall(function() return invokeMember(object, getterName) end, nil)
             local candidate = textValue(raw)
@@ -1238,15 +1212,15 @@ local function songMetadata(song, beatMap)
         end
     end
     local metadata = {
-        title = property(song, { "GetName", "_songName", "m_songName", "Title", "@_songName", "@Title", "@SongTitle", "@SongName", "@Name", "@m_songName", "@m_name" })
-            or property(beatMap, { "_songName", "m_songName", "Title", "@_songName", "@Title", "@SongTitle", "@SongName", "@Name", "@m_songName", "@m_name" }),
-        artist = property(song, { "GetBand", "_songAuthorName", "m_songAuthorName", "Artist", "AuthorName", "@_songAuthorName", "@Artist", "@ArtistName", "@AuthorName", "@m_artist", "@m_artistName", "@m_authorName" })
-            or property(beatMap, { "_songAuthorName", "m_songAuthorName", "Artist", "AuthorName", "@_songAuthorName", "@Artist", "@ArtistName", "@AuthorName", "@m_artist", "@m_artistName", "@m_authorName" }),
-        mapper = property(song, { "GetLevelAuthor", "_levelAuthorName", "m_levelAuthorName", "LevelAuthorName", "Mapper", "AuthorName", "@_levelAuthorName", "@LevelAuthorName", "@Mapper", "@AuthorName", "@m_levelAuthorName", "@m_mapper", "@m_authorName" })
-            or property(beatMap, { "_levelAuthorName", "m_levelAuthorName", "LevelAuthorName", "@_levelAuthorName", "@LevelAuthorName", "@Mapper", "@m_levelAuthorName", "@m_mapper" }),
-        difficulties = listProperty(song, { "GetBeatMapsLevels", "@BeatMaps", "@m_beatMaps", "@Levels", "@m_levels", "@Difficulties", "@m_difficulties" }),
+        title = property(song, { "GetName", "Title", "@Title", "@Name" })
+            or property(beatMap, { "Title", "@Title", "@Name" }),
+        artist = property(song, { "GetBand", "Artist", "AuthorName", "@Artist", "@ArtistName", "@AuthorName" })
+            or property(beatMap, { "Artist", "AuthorName", "@Artist", "@ArtistName", "@AuthorName" }),
+        mapper = property(song, { "GetLevelAuthor", "LevelAuthorName", "Mapper", "@LevelAuthorName", "@Mapper" })
+            or property(beatMap, { "LevelAuthorName", "Mapper", "@LevelAuthorName", "@Mapper" }),
+        difficulties = listProperty(song, { "GetBeatMapsLevels", "@BeatMaps", "@Levels", "@Difficulties" }),
     }
-    local values = listProperty(song, { "GetBeatMapsLevels", "@BeatMaps", "@m_beatMaps", "@Levels", "@m_levels", "@Difficulties", "@m_difficulties" })
+    local values = listProperty(song, { "GetBeatMapsLevels", "@BeatMaps", "@Levels", "@Difficulties" })
     metadata.difficulties = {}
     for _, map in ipairs(values) do
         local rankObject = objectValue(map, {
@@ -1333,49 +1307,6 @@ local function probeLiveProperties(object, label, names)
     end
 end
 
-local function normalized(value)
-    return string.lower(tostring(value or "")):gsub("[%p%c]", " "):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-end
-
-local function oneOf(value, values)
-    local needle = normalized(value)
-    if needle == "" then return true end
-    for _, item in ipairs(values or {}) do
-        local candidate = normalized(item)
-        if candidate ~= "" and (needle == candidate or candidate:find(needle, 1, true) or needle:find(candidate, 1, true)) then return true end
-    end
-    return false
-end
-
-local function matchesCatalogSong(song, metadata)
-    if song == nil or metadata == nil then return false end
-    if metadata.title == nil or not oneOf(metadata.title, { song.title, song.name }) then return false end
-    if metadata.artist ~= nil and metadata.artist ~= "" then
-        if not oneOf(metadata.artist, song.artists or {}) then return false end
-    end
-    if metadata.mapper ~= nil and metadata.mapper ~= "" then
-        if song.mapper == nil or song.mapper == ""
-            or normalized(metadata.mapper) ~= normalized(song.mapper) then
-            return false
-        end
-    end
-    if #metadata.difficulties > 0 then
-        if #song.difficulties == 0 then return false end
-        for _, difficulty in ipairs(metadata.difficulties) do
-            if not oneOf(difficulty, song.difficulties) then return false end
-        end
-    end
-    return true
-end
-
-local function catalogCandidates(songs, metadata)
-    local result = {}
-    for _, song in ipairs(songs or {}) do
-        if matchesCatalogSong(song, metadata) then table.insert(result, song) end
-    end
-    return result
-end
-
 local function resolveCatalogId(folder, metadata, generation)
     if folder == nil or metadata == nil or state.resolutionPending then return end
     state.resolutionPending = true
@@ -1384,42 +1315,31 @@ local function resolveCatalogId(folder, metadata, generation)
         state.resolutionPending = false
         if id ~= nil then
             state.songId = tonumber(id)
-            if type(Api.writeInstalledSongId) == "function" then
-                local written, writeError, writePath = Api.writeInstalledSongId(folder, state.songId)
-                if written == nil then
-                    log("error", "failed to cache loaded song .id path=" .. tostring(writePath or folder)
-                        .. " error=" .. tostring(writeError))
-                else
-                    log("info", "cached loaded song .id path=" .. tostring(writePath or folder)
-                        .. " id=" .. tostring(written))
-                end
-            end
             log("info", message .. " id=" .. tostring(state.songId))
         end
     end
     local cached = type(Api.readInstalledSongId) == "function" and safeCall(function() return Api.readInstalledSongId(folder) end, nil) or nil
-    local function searchFallback(expectedId)
-        local query = tostring(metadata.artist or "") .. " " .. tostring(metadata.title or "")
-        Api.search(query, { _onResult = function(songs, err)
-            if err ~= nil then finish(nil, "catalog search failed: " .. tostring(err.message or err)) return end
-            local matches = catalogCandidates(songs, metadata)
-            if #matches ~= 1 then finish(nil, "catalog search did not uniquely resolve loaded song") return end
-            local candidate = matches[1]
-            local candidateId = tonumber(candidate.id)
-            if expectedId ~= nil and candidateId == tonumber(expectedId) then
-                finish(candidateId, "validated loaded song .id against metadata search")
-            else
-                finish(candidateId, expectedId ~= nil
-                    and "replaced invalid loaded song .id from metadata search"
-                    or "resolved loaded song by metadata search and cached")
-            end
-        end })
+    local function discovered(id, err, result)
+        if err ~= nil then
+            finish(nil, "catalog discovery failed: " .. tostring(err.message or err))
+            return
+        end
+        local status = result and result.status or "resolved"
+        local messages = {
+            validated = "validated loaded song .id against metadata search",
+            replaced = "replaced invalid loaded song .id from metadata search",
+            resolved = "resolved loaded song by metadata search and cached",
+        }
+        finish(id, messages[status] or messages.resolved)
     end
-    if cached ~= nil then
-        searchFallback(cached)
-    else
-        searchFallback(nil)
+    if type(Api.discoverInstalledSongId) ~= "function" then
+        finish(nil, "RagnaCustomsApi does not provide discoverInstalledSongId")
+        return
     end
+    Api.discoverInstalledSongId(folder, metadata, {
+        existingId = cached,
+        callback = discovered,
+    })
 end
 
 local function resolvePlayedSongState(manager)
@@ -1452,9 +1372,6 @@ local function resolvePlayedSongState(manager)
     local rawCustom = song and safeCall(function()
         return song:IsCustom()
     end, nil) or nil
-    -- Resolution must be anchored to the object that is actually loaded by
-    -- the game. Do not use the test fixture folder, a hash lookup, or an
-    -- installed-catalog scan as a substitute for the live Song/BeatMap path.
     local folderOk, folder = pcall(function()
         return loadedSongFolder(song) or loadedSongFolder(beatMap) or loadedSongFolder(manager)
     end)
