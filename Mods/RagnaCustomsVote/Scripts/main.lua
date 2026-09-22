@@ -15,6 +15,10 @@ local function loadApiDependency()
         and type(Api.getSongVote) == "function"
         and type(Api.upvote) == "function"
         and type(Api.downvote) == "function"
+        and type(Api.readInstalledSongId) == "function"
+        and type(Api.writeInstalledSongId) == "function"
+        and type(Api.search) == "function"
+        and type(Api.getSong) == "function"
         and type(Api.on) == "function" then
         return Api
     end
@@ -40,6 +44,10 @@ if type(Api) ~= "table"
     or type(Api.getSongVote) ~= "function"
     or type(Api.upvote) ~= "function"
     or type(Api.downvote) ~= "function"
+    or type(Api.readInstalledSongId) ~= "function"
+    or type(Api.writeInstalledSongId) ~= "function"
+    or type(Api.search) ~= "function"
+    or type(Api.getSong) ~= "function"
     or type(Api.on) ~= "function" then
     log("error", "RagnaCustomsApi >= 0.3.0 is required")
     return
@@ -53,6 +61,10 @@ local state = _G.__ragnaCustomsVoteState or {
     buttonHooksInstalled = false,
     beatmap = nil,
     songId = nil,
+    songFolder = nil,
+    songMetadata = nil,
+    resolutionKey = nil,
+    resolutionPending = false,
     custom = nil,
     panelPath = nil,
     mode = nil,
@@ -100,6 +112,34 @@ local function valid(object)
     return safeCall(function()
         return object:IsValid()
     end, true)
+end
+
+local function runtimeSongFolder()
+    if os ~= nil and type(os.getenv) == "function" then
+        local testFolder = os.getenv("RAGNA_TEST_SONG_FOLDER")
+        if testFolder ~= nil and testFolder ~= "" then
+            return testFolder
+        end
+    end
+    local folder = type(Api.resolveSongFolder) == "function"
+        and safeCall(function() return Api.resolveSongFolder() end, nil) or nil
+    if folder ~= nil and folder ~= "" then
+        return folder
+    end
+    if type(Api.getRuntimePaths) ~= "function" then
+        return nil
+    end
+    local paths = safeCall(function() return Api.getRuntimePaths() end, nil)
+    local gameDir = paths and paths.gameDir or nil
+    if gameDir == nil or gameDir == "" then
+        return nil
+    end
+    local normalized = tostring(gameDir):gsub("\\", "/"):gsub("/+$", "")
+    local steamRoot = normalized:match("^(.*)/steamapps/common/Ragnarock$")
+    if steamRoot ~= nil then
+        return steamRoot .. "/steamapps/compatdata/1345820/pfx/drive_c/users/steamuser/Documents/Ragnarock/CustomSongs"
+    end
+    return normalized .. "/CustomSongs"
 end
 
 local function fullName(object)
@@ -1018,84 +1058,450 @@ local function extractSongId(value)
     return id and tonumber(id) or nil
 end
 
-local function songIdFromObject(song)
-    if song == nil then return nil end
-    for _, accessor in ipairs({
-        function() return song:GetSongId() end,
-        function() return song:GetSongID() end,
-        function() return song:GetId() end,
-        function() return song:GetID() end,
-        function() return song:GetCustomSongId() end,
-        function() return song:GetCustomSongID() end,
-        function() return song.SongId end,
-        function() return song.SongID end,
-        function() return song.Id end,
-        function() return song.ID end,
-        function() return song.m_songId end,
-        function() return song.m_songID end,
-        function() return song.CustomSongId end,
-        function() return song.CustomSongID end,
-        function() return song.m_id end,
-        function() return song:GetCompositeId() end,
-        function() return song:GetCompositeID() end,
-        function() return song.CompositeId end,
-        function() return song.CompositeID end,
-        function() return song.m_compositeId end,
-        function() return song.m_compositeID end,
-        function() return song:GetPath() end,
-        function() return song.Path end,
-        function() return song.FolderPath end,
-        function() return song.m_folderPath end,
-        function() return song:GetPropertyValue("SongId") end,
-        function() return song:GetPropertyValue("SongID") end,
-        function() return song:GetPropertyValue("Id") end,
-        function() return song:GetPropertyValue("ID") end,
-    }) do
-        local candidate = safeCall(accessor, nil)
-        local id = extractSongId(candidate)
-        if id ~= nil then return id end
+local function textValue(value)
+    if value == nil then return nil end
+    if type(value) == "string" then return value:gsub("^%s+", ""):gsub("%s+$", "") end
+    if type(value) == "number" or type(value) == "boolean" then return tostring(value) end
+    local valueType = tostring(safeCall(function() return value:type() end, ""))
+    if valueType == "RemoteUnrealParam" or valueType == "LocalUnrealParam" then
+        local inner = safeCall(function() return value:get() end, nil)
+        if inner ~= nil and inner ~= value then return textValue(inner) end
+    elseif valueType == "FString" or valueType == "FText" then
+        return safeCall(function() return value:ToString() end, nil)
     end
-    return extractSongId(fullName(song))
+    return nil
 end
 
-local function installedSongId(hash)
-    if hash == nil or type(Api.getInstalledSong) ~= "function" then return nil end
-    local installed = safeCall(function()
-        return Api.getInstalledSong(hash)
-    end, nil)
-    return installed and extractSongId(installed.id or installed.path) or nil
+local function invokeMember(object, name)
+    if object == nil or type(object.CallFunction) ~= "function" then return nil end
+    local member = safeCall(function() return object[name] end, nil)
+    if member == nil and type(StaticFindObject) == "function" then
+        local class = safeCall(function() return object:GetClass() end, nil)
+        local className = tostring(fullName(class or "")):gsub("^Class ", "")
+        if className ~= "" then
+            member = safeCall(function()
+                return StaticFindObject("Function " .. className .. ":" .. name)
+            end, nil)
+        end
+    end
+    if member == nil then return nil end
+    local direct = safeCall(function() return member(object) end, nil)
+    if direct ~= nil then return direct end
+    return safeCall(function() return object:CallFunction(member) end, nil)
+end
+
+local function objectValue(object, names)
+    if object == nil then return nil end
+    for _, name in ipairs(names or {}) do
+        local value = safeCall(function()
+            if name:sub(1, 1) == "@" then
+                return object:GetPropertyValue(name:sub(2))
+            end
+            local member = object[name]
+            if type(member) == "function" then return member(object) end
+            if member ~= nil and tostring(fullName(member)):match("^Function ") then
+                return invokeMember(object, name)
+            end
+            return member
+        end, nil)
+        value = unwrap(value)
+        if value ~= nil and type(value) ~= "string" and type(value) ~= "number"
+            and type(value) ~= "boolean" and type(value) ~= "function" and valid(value) then
+            local name = fullName(value)
+            if not name:match("^Function ") then return value end
+        end
+    end
+    return nil
+end
+
+local function relatedSong(object)
+    local direct = invokeMember(object, "GetSong")
+    if direct ~= nil and type(direct) ~= "function" and valid(direct) then
+        return direct
+    end
+    return objectValue(object, {
+        "GetSong", "Song", "m_song", "SongData", "m_songData", "GetSongData",
+        "GetSongInfo", "SongInfo", "m_songInfo", "@Song", "@SongData",
+    })
+end
+
+local function property(object, names)
+    if object == nil then return nil end
+    for _, name in ipairs(names or {}) do
+        local value = safeCall(function()
+            if name:sub(1, 1) == "@" then
+                return object:GetPropertyValue(name:sub(2))
+            end
+            local member = object[name]
+            if type(member) == "function" then return member(object) end
+            if member ~= nil and tostring(fullName(member)):match("^Function ") then
+                return invokeMember(object, name)
+            end
+            return member
+        end, nil)
+        local text = textValue(value)
+        if text ~= nil and text ~= "" and text ~= "None" then return text end
+    end
+    return nil
+end
+
+local function loadedSongFolder(object)
+    local candidates = {
+        state.liveSongPath,
+    }
+    if object ~= nil and not state.diagnostics.pathFunctionProbe then
+        state.diagnostics.pathFunctionProbe = true
+        local getterNames = { "GetPath", "GetFileName" }
+        for _, getterName in ipairs(getterNames) do
+            local raw = safeCall(function() return invokeMember(object, getterName) end, nil)
+            local candidate = textValue(raw)
+            if candidate ~= nil and candidate ~= "" then
+                table.insert(candidates, candidate)
+                log("info", "live song path getter=" .. getterName .. " value=" .. candidate)
+            end
+        end
+    end
+    for candidateIndex, candidate in ipairs(candidates) do
+        local path = type(candidate) == "string" and candidate:gsub("\\", "/"):gsub("/+", "/") or nil
+        if (state.diagnostics.pathProbeCount or 0) < 16 then
+            state.diagnostics.pathProbeCount = (state.diagnostics.pathProbeCount or 0) + 1
+            log("info", "live song path candidate=" .. tostring(candidateIndex) .. "=" .. tostring(path))
+        end
+        local lower = path and string.lower(path) or ""
+        local marker = lower:find("/customsongs/", 1, true) or lower:find("customsongs/", 1, true)
+        if marker ~= nil then
+            local markerText = lower:sub(marker, marker + #"customsongs/" - 1):find("customsongs/", 1, true) == 1 and "customsongs/" or "/customsongs/"
+            local rest = path:sub(marker + #markerText)
+            local slash = rest:find("/", 1, true)
+            path = slash and path:sub(1, marker + #markerText + slash - 1) or path
+            if path:sub(-1) == "/" then path = path:sub(1, -2) end
+            if path:lower():match("%.dat$") or path:lower():match("%.json$") then
+                path = path:match("^(.+)/[^/]+$")
+            end
+            if path ~= nil and path ~= "" then return path end
+        end
+    end
+    state.diagnostics.pathProbe = true
+    local nested = relatedSong(object)
+    if nested ~= nil and nested ~= object then
+        return loadedSongFolder(nested)
+    end
+    return nil
+end
+
+local function listProperty(object, names)
+    local value = nil
+    for _, name in ipairs(names or {}) do
+        value = safeCall(function()
+            if name:sub(1, 1) == "@" then return object:GetPropertyValue(name:sub(2)) end
+            local member = object[name]
+            if member ~= nil and tostring(fullName(member)):match("^Function ") then
+                return invokeMember(object, name)
+            end
+            return member
+        end, nil)
+        if value ~= nil then break end
+    end
+    local result = {}
+    if value ~= nil and type(value) == "table" then
+        for _, entry in ipairs(value) do table.insert(result, entry) end
+    else
+        local forEach = value ~= nil and safeCall(function() return value.ForEach end, nil) or nil
+        if type(forEach) ~= "function" then return result end
+        safeCall(function() value:ForEach(function(entry) table.insert(result, entry) end) end, nil)
+    end
+    return result
+end
+
+local function songMetadata(song, beatMap)
+    if false then
+        state.diagnostics.getterProbe = true
+        for _, name in ipairs({ "GetPath", "GetName", "GetBand", "GetLevelAuthor", "GetBeatMapsLevels" }) do
+            local raw = invokeMember(song, name)
+            log("info", "live getter probe name=" .. name .. " raw=" .. tostring(raw)
+                .. " type=" .. type(raw) .. " valueType=" .. tostring(safeCall(function() return raw:type() end, nil))
+                .. " tostring=" .. tostring(safeCall(function() return raw:ToString() end, nil))
+                .. " get=" .. tostring(safeCall(function() return raw:get() end, nil))
+                .. " text=" .. tostring(textValue(raw)))
+            if type(raw) == "table" then
+                for index, entry in ipairs(raw) do
+                    if index <= 16 then
+                        log("info", "live getter table name=" .. name .. " index=" .. tostring(index)
+                            .. " entry=" .. tostring(entry) .. " entryType=" .. type(entry)
+                            .. " valueType=" .. tostring(safeCall(function() return entry:type() end, nil))
+                            .. " get=" .. tostring(safeCall(function() return entry:get() end, nil))
+                            .. " Get=" .. tostring(safeCall(function() return entry:Get() end, nil))
+                            .. " text=" .. tostring(textValue(entry)))
+                    end
+                end
+            end
+        end
+    end
+    local metadata = {
+        title = property(song, { "GetName", "_songName", "m_songName", "Title", "@_songName", "@Title", "@SongTitle", "@SongName", "@Name", "@m_songName", "@m_name" })
+            or property(beatMap, { "_songName", "m_songName", "Title", "@_songName", "@Title", "@SongTitle", "@SongName", "@Name", "@m_songName", "@m_name" }),
+        artist = property(song, { "GetBand", "_songAuthorName", "m_songAuthorName", "Artist", "AuthorName", "@_songAuthorName", "@Artist", "@ArtistName", "@AuthorName", "@m_artist", "@m_artistName", "@m_authorName" })
+            or property(beatMap, { "_songAuthorName", "m_songAuthorName", "Artist", "AuthorName", "@_songAuthorName", "@Artist", "@ArtistName", "@AuthorName", "@m_artist", "@m_artistName", "@m_authorName" }),
+        mapper = property(song, { "GetLevelAuthor", "_levelAuthorName", "m_levelAuthorName", "LevelAuthorName", "Mapper", "AuthorName", "@_levelAuthorName", "@LevelAuthorName", "@Mapper", "@AuthorName", "@m_levelAuthorName", "@m_mapper", "@m_authorName" })
+            or property(beatMap, { "_levelAuthorName", "m_levelAuthorName", "LevelAuthorName", "@_levelAuthorName", "@LevelAuthorName", "@Mapper", "@m_levelAuthorName", "@m_mapper" }),
+        difficulties = listProperty(song, { "GetBeatMapsLevels", "@BeatMaps", "@m_beatMaps", "@Levels", "@m_levels", "@Difficulties", "@m_difficulties" }),
+    }
+    local values = listProperty(song, { "GetBeatMapsLevels", "@BeatMaps", "@m_beatMaps", "@Levels", "@m_levels", "@Difficulties", "@m_difficulties" })
+    metadata.difficulties = {}
+    for _, map in ipairs(values) do
+        local rankObject = objectValue(map, {
+            "GetDifficultyRank", "DifficultyRank", "m_difficultyRank", "@DifficultyRank", "@m_difficultyRank",
+        })
+        local level = property(rankObject, { "GetLevel", "m_level", "Level", "@Level" })
+            or property(map, { "GetDifficultyRankLevel", "DifficultyRankLevel", "@DifficultyRankLevel" })
+            or property(map, { "GetLevel", "m_level", "Level", "@Level" })
+            or safeCall(function() return map:get() end, nil)
+            or textValue(map)
+        if level ~= nil then table.insert(metadata.difficulties, level) end
+    end
+    if #metadata.difficulties == 0 and beatMap ~= nil then
+        local rankObject = objectValue(beatMap, {
+            "GetDifficultyRank", "DifficultyRank", "m_difficultyRank", "@DifficultyRank", "@m_difficultyRank",
+        })
+        local level = property(rankObject, { "GetLevel", "m_level", "Level", "@Level" })
+            or property(beatMap, { "GetDifficultyRankLevel", "DifficultyRankLevel", "@DifficultyRankLevel" })
+            or property(beatMap, { "GetLevel", "m_level", "Level", "@Level" })
+        if level ~= nil then table.insert(metadata.difficulties, level) end
+    end
+    return metadata
+end
+
+local function probeLiveProperties(object, label, names)
+    if object == nil then return end
+    for _, name in ipairs(names or {}) do
+        local value = safeCall(function() return object:GetPropertyValue(name) end, nil)
+        local direct = safeCall(function() return object[name] end, nil)
+        if value ~= nil then
+            local text = textValue(value)
+            log("info", "live property probe object=" .. label .. " name=" .. name
+                .. " raw=" .. tostring(value) .. " type=" .. type(value)
+                .. " direct=" .. tostring(direct) .. " directType=" .. type(direct)
+                .. " text=" .. tostring(text))
+        end
+    end
+    local class = safeCall(function() return object:GetClass() end, nil)
+    log("info", "live reflected class object=" .. label .. " class=" .. tostring(class) .. " className=" .. tostring(fullName(class)))
+    if class ~= nil then
+        local count = 0
+        local visited = 0
+        while valid(class) and visited < 12 and count < 160 do
+            visited = visited + 1
+            safeCall(function()
+                class:ForEachProperty(function(prop)
+                    count = count + 1
+                    if count <= 160 then
+                        local propName = safeCall(function() return prop:GetFullName() end, nil)
+                            or safeCall(function() return prop:GetName() end, nil)
+                        local shortName = tostring(propName or ""):match("([^%.:]+)$") or tostring(propName or "")
+                        local raw = safeCall(function() return object:GetPropertyValue(shortName) end, nil)
+                        local directValue = safeCall(function() return object[shortName] end, nil)
+                        log("info", "live reflected property object=" .. label
+                            .. " name=" .. tostring(shortName)
+                            .. " raw=" .. tostring(raw) .. " rawType=" .. type(raw)
+                            .. " direct=" .. tostring(directValue) .. " directType=" .. type(directValue)
+                            .. " text=" .. tostring(textValue(raw) or textValue(directValue)))
+                    end
+                    return false
+                end)
+            end, nil)
+            class = safeCall(function() return class:GetSuperStruct() end, nil)
+        end
+        log("info", "live reflected property count object=" .. label .. " count=" .. tostring(count))
+        local functionCount = 0
+        class = safeCall(function() return object:GetClass() end, nil)
+        visited = 0
+        while valid(class) and visited < 12 and functionCount < 240 do
+            visited = visited + 1
+            safeCall(function()
+                class:ForEachFunction(function(fn)
+                    functionCount = functionCount + 1
+                    if functionCount <= 240 then
+                        log("info", "live reflected function object=" .. label
+                            .. " name=" .. tostring(safeCall(function() return fn:GetFullName() end, nil)
+                                or safeCall(function() return fn:GetName() end, nil)))
+                    end
+                end)
+            end, nil)
+            class = safeCall(function() return class:GetSuperStruct() end, nil)
+        end
+        log("info", "live reflected function count object=" .. label .. " count=" .. tostring(functionCount))
+    end
+end
+
+local function normalized(value)
+    return string.lower(tostring(value or "")):gsub("[%p%c]", " "):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function oneOf(value, values)
+    local needle = normalized(value)
+    if needle == "" then return true end
+    for _, item in ipairs(values or {}) do
+        local candidate = normalized(item)
+        if candidate ~= "" and (needle == candidate or candidate:find(needle, 1, true) or needle:find(candidate, 1, true)) then return true end
+    end
+    return false
+end
+
+local function matchesCatalogSong(song, metadata)
+    if song == nil or metadata == nil then return false end
+    if metadata.title == nil or not oneOf(metadata.title, { song.title, song.name }) then return false end
+    if metadata.artist ~= nil and metadata.artist ~= "" then
+        if not oneOf(metadata.artist, song.artists or {}) then return false end
+    end
+    if metadata.mapper ~= nil and metadata.mapper ~= "" then
+        if song.mapper == nil or song.mapper == ""
+            or normalized(metadata.mapper) ~= normalized(song.mapper) then
+            return false
+        end
+    end
+    if #metadata.difficulties > 0 then
+        if #song.difficulties == 0 then return false end
+        for _, difficulty in ipairs(metadata.difficulties) do
+            if not oneOf(difficulty, song.difficulties) then return false end
+        end
+    end
+    return true
+end
+
+local function catalogCandidates(songs, metadata)
+    local result = {}
+    for _, song in ipairs(songs or {}) do
+        if matchesCatalogSong(song, metadata) then table.insert(result, song) end
+    end
+    return result
+end
+
+local function resolveCatalogId(folder, metadata, generation)
+    if folder == nil or metadata == nil or state.resolutionPending then return end
+    state.resolutionPending = true
+    local function finish(id, message)
+        if generation ~= state.resolutionGeneration then return end
+        state.resolutionPending = false
+        if id ~= nil then
+            state.songId = tonumber(id)
+            if type(Api.writeInstalledSongId) == "function" then
+                local written, writeError, writePath = Api.writeInstalledSongId(folder, state.songId)
+                if written == nil then
+                    log("error", "failed to cache loaded song .id path=" .. tostring(writePath or folder)
+                        .. " error=" .. tostring(writeError))
+                else
+                    log("info", "cached loaded song .id path=" .. tostring(writePath or folder)
+                        .. " id=" .. tostring(written))
+                end
+            end
+            log("info", message .. " id=" .. tostring(state.songId))
+        end
+    end
+    local cached = type(Api.readInstalledSongId) == "function" and safeCall(function() return Api.readInstalledSongId(folder) end, nil) or nil
+    local function searchFallback(expectedId)
+        local query = tostring(metadata.artist or "") .. " " .. tostring(metadata.title or "")
+        Api.search(query, { _onResult = function(songs, err)
+            if err ~= nil then finish(nil, "catalog search failed: " .. tostring(err.message or err)) return end
+            local matches = catalogCandidates(songs, metadata)
+            if #matches ~= 1 then finish(nil, "catalog search did not uniquely resolve loaded song") return end
+            local candidate = matches[1]
+            local candidateId = tonumber(candidate.id)
+            if expectedId ~= nil and candidateId == tonumber(expectedId) then
+                finish(candidateId, "validated loaded song .id against metadata search")
+            else
+                finish(candidateId, expectedId ~= nil
+                    and "replaced invalid loaded song .id from metadata search"
+                    or "resolved loaded song by metadata search and cached")
+            end
+        end })
+    end
+    if cached ~= nil then
+        searchFallback(cached)
+    else
+        searchFallback(nil)
+    end
 end
 
 local function resolvePlayedSongState(manager)
-    if not valid(manager) then
+    if not valid(manager) and not valid(state.liveBeatMap) then
         return false
     end
-    local song = safeCall(function()
+    local song = valid(manager) and safeCall(function()
         return manager:GetSong()
     end, safeCall(function()
         return manager.m_song
-    end, nil))
-    local beatMap = safeCall(function()
+    end, nil)) or state.liveSong or relatedSong(state.liveBeatMap)
+    local beatMap = valid(manager) and safeCall(function()
         return manager:GetBeatMap()
     end, safeCall(function()
         return manager.m_beatMap
-    end, nil))
+    end, nil)) or state.liveBeatMap
+    log("info", "live song objects manager=" .. tostring(valid(manager) and fullName(manager) or "nil")
+        .. " song=" .. tostring(song ~= nil and fullName(song) or "nil")
+        .. " beatMap=" .. tostring(beatMap ~= nil and fullName(beatMap) or "nil"))
+    -- Capture the live hash before consulting the installed catalog. On the
+    -- first Results poll state.beatmap is usually still empty; resolving the
+    -- catalog before filling it leaves the one-shot capture marked complete
+    -- and prevents the fixture's .id marker from ever being used.
+    if beatMap ~= nil and state.beatmap == nil then
+        local beatMapHash = safeCall(function() return beatMap:GetHash() end, nil)
+        state.beatmap = extractHash(beatMapHash)
+    end
+    log("info", "song resolution probe beatmap=" .. tostring(state.beatmap)
+        .. " beatMap=" .. tostring(beatMap))
     local rawCustom = song and safeCall(function()
         return song:IsCustom()
     end, nil) or nil
-    state.songId = songIdFromObject(song)
-        or songIdFromObject(beatMap)
-        or installedSongId(state.beatmap)
-        or state.songId
+    -- Resolution must be anchored to the object that is actually loaded by
+    -- the game. Do not use the test fixture folder, a hash lookup, or an
+    -- installed-catalog scan as a substitute for the live Song/BeatMap path.
+    local folderOk, folder = pcall(function()
+        return loadedSongFolder(song) or loadedSongFolder(beatMap) or loadedSongFolder(manager)
+    end)
+    if not folderOk then
+        log("warn", "live song folder resolver error=" .. tostring(folder))
+        folder = nil
+    end
+    local metadata = safeCall(function() return songMetadata(song, beatMap) end, {
+        title = nil,
+        artist = nil,
+        mapper = nil,
+        difficulties = {},
+    })
+    if false then
+        state.diagnostics.livePropertiesProbed = true
+        probeLiveProperties(song, "Song", {
+            "Title", "SongTitle", "SongName", "Name", "Artist", "ArtistName", "AuthorName",
+            "Mapper", "LevelAuthorName", "SongPath", "FolderPath", "CustomSongPath", "FilePath",
+            "m_title", "m_songName", "m_name", "m_artist", "m_authorName", "m_mapper", "m_songPath", "m_folderPath",
+        })
+        probeLiveProperties(beatMap, "BeatMap", {
+            "Title", "SongTitle", "SongName", "Name", "Artist", "ArtistName", "AuthorName",
+            "Mapper", "LevelAuthorName", "SongPath", "FolderPath", "CustomSongPath", "FilePath",
+            "m_title", "m_songName", "m_name", "m_artist", "m_authorName", "m_mapper", "m_songPath", "m_folderPath",
+            "GetLevel", "Difficulty", "DifficultyRank", "GetDifficultyRank", "m_difficultyRank",
+        })
+    end
+    local difficultyText = {}
+    for _, difficulty in ipairs(metadata.difficulties or {}) do table.insert(difficultyText, tostring(difficulty)) end
+    log("info", "live song metadata folder=" .. tostring(folder)
+        .. " title=" .. tostring(metadata.title)
+        .. " artist=" .. tostring(metadata.artist)
+        .. " mapper=" .. tostring(metadata.mapper)
+        .. " difficulties=" .. table.concat(difficultyText, ","))
+    local key = tostring(folder or "") .. "|" .. tostring(state.beatmap or "")
+    if key ~= state.resolutionKey then
+        state.resolutionKey = key
+        state.resolutionGeneration = (state.resolutionGeneration or 0) + 1
+        state.resolutionPending = false
+        state.songId = nil
+        state.songFolder = folder
+        state.songMetadata = metadata
+        resolveCatalogId(folder, metadata, state.resolutionGeneration)
+    end
     local custom = extractBoolean(rawCustom)
     if custom ~= nil then
         state.custom = custom
-    end
-    if beatMap ~= nil then
-        safeCall(function()
-            beatMap:GetHash()
-            return true
-        end, false)
     end
     if state.custom ~= nil and state.beatmap ~= nil and state.songId ~= nil then
         if not state.diagnostics.playedSongResolved then
@@ -1105,7 +1511,9 @@ local function resolvePlayedSongState(manager)
         end
         return true
     end
-    return false
+    -- Resolution continues through the API callbacks. Once the live object has
+    -- yielded its folder, do not re-run reflection on every results poll.
+    return state.songFolder ~= nil
 end
 
 extractBoolean = function(...)
@@ -1141,11 +1549,19 @@ local function installHooks()
     state.hooksInstalled = true
     local hashPost = function(...)
         local hash = extractHash(...)
+        for index = 1, select("#", ...) do
+            local candidate = unwrap(select(index, ...))
+            if valid(candidate) and type(candidate) ~= "function" then
+                local name = fullName(candidate)
+                if name:find("BeatMap", 1, true) ~= nil then
+                    state.liveBeatMap = candidate
+                elseif name:find("Song", 1, true) ~= nil then
+                    state.liveSong = candidate
+                end
+            end
+        end
         if hash ~= nil then
             state.beatmap = hash
-        end
-        for index = 1, select("#", ...) do
-            state.songId = extractSongId(select(index, ...)) or state.songId
         end
     end
     local customPost = function(...)
@@ -1160,12 +1576,35 @@ local function installHooks()
         installHook("/Script/Ragnarock." .. owner .. ":IsCustomSong", function() end, customPost)
     end
     installHook("/Script/Ragnarock.BeatMap:GetHash", function() end, hashPost)
+    local function captureSongStringHook(label)
+        return function(self, ...)
+            for index = 1, select("#", ...) do
+                local value = select(index, ...)
+                local valueType = tostring(safeCall(function() return value:type() end, ""))
+                local text = safeCall(function()
+                    if valueType == "RemoteUnrealParam" then value = value:get() end
+                    if value ~= nil and tostring(safeCall(function() return value:type() end, "")) == "FString" then
+                        return value:ToString()
+                    end
+                    return type(value) == "string" and value or nil
+                end, nil)
+                if text ~= nil and text ~= "" then
+                    local normalizedText = text:gsub("\\", "/")
+                    if normalizedText:lower():find("customsongs/", 1, true) then
+                        state.liveSongPath = normalizedText
+                        log("info", "captured live Song." .. label .. " path=" .. normalizedText)
+                    end
+                end
+            end
+        end
+    end
+    installHook("/Script/Ragnarock.Song:SetPath", function() end, captureSongStringHook("SetPath"))
+    installHook("/Script/Ragnarock.Song:Setup", function() end, captureSongStringHook("Setup"))
 end
 
 _G.RagnaCustomsVoteSetBeatmapHash = function(hash, isCustom, songId)
     state.beatmap = hash and extractHash(hash) or nil
     state.custom = isCustom == true
-    state.songId = extractSongId(songId) or installedSongId(state.beatmap)
 end
 
 local function poll()
@@ -1178,11 +1617,12 @@ local function poll()
     if panel ~= nil then
         manager, managerName = findPlayedSongManager()
     end
-    if panel ~= nil and manager ~= nil and not state.captureQueued
-        and (state.captureManagerPath ~= managerName or state.captureResolved ~= true) then
+    local liveObjectPath = managerName or (valid(state.liveBeatMap) and fullName(state.liveBeatMap) or nil)
+    if panel ~= nil and (manager ~= nil or valid(state.liveBeatMap)) and not state.captureQueued
+        and (state.captureManagerPath ~= liveObjectPath or state.captureResolved ~= true) then
         state.captureQueued = true
         local function captureOnGameThread()
-            state.captureManagerPath = managerName
+            state.captureManagerPath = liveObjectPath
             state.captureResolved = resolvePlayedSongState(manager)
             state.captureQueued = false
         end
