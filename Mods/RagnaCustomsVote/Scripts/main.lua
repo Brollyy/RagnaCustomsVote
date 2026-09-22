@@ -685,29 +685,16 @@ local function applyResponse(result)
     end
 end
 
-local function jsonNumberField(body, name)
-    return tonumber(tostring(body or ""):match('"' .. name .. '"%s*:%s*(-?%d+%.?%d*)'))
-end
-
-local function jsonStringField(body, name)
-    local value = tostring(body or ""):match('"' .. name .. '"%s*:%s*"([^"]*)"')
-    if value == nil and tostring(body or ""):match('"' .. name .. '"%s*:%s*null') ~= nil then
-        return nil
-    end
-    return value
-end
-
-local function apiVoteResult(responseBody, error)
+local function apiVoteResult(responseState, error)
     if error ~= nil then
         return { ok = false, error = error }
     end
-    local body = type(responseBody) == "table" and responseBody.body or responseBody
-    local upvotes = jsonNumberField(body, "upvotes")
-    local downvotes = jsonNumberField(body, "downvotes")
+    local upvotes = type(responseState) == "table" and tonumber(responseState.upvotes) or nil
+    local downvotes = type(responseState) == "table" and tonumber(responseState.downvotes) or nil
     if upvotes == nil or downvotes == nil then
         return { ok = false, error = { code = "invalid_response", message = "vote response is missing counts" } }
     end
-    local currentVote = jsonStringField(body, "currentVote")
+    local currentVote = responseState.currentVote
     if currentVote ~= nil and currentVote ~= "up" and currentVote ~= "down" then
         return { ok = false, error = { code = "invalid_response", message = "vote response contains an invalid selection" } }
     end
