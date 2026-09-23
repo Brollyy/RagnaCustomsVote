@@ -58,6 +58,21 @@ end
 -- The 0.3 API uses its documented catalog transport and numeric song IDs.
 Api.configure({ preferApi = true, transport = "varest" })
 
+local function configureApiFromGameSettings()
+    if type(Api.configureFromGameCustomApiUrls) ~= "function" then return end
+    local ok, configured, err = pcall(function()
+        return Api.configureFromGameCustomApiUrls()
+    end)
+    if not ok then
+        configured, err = nil, { code = "configuration_failed", message = configured }
+    end
+    if configured ~= nil then
+        log("info", "configured API from Ragnarock CustomApiURLs base=" .. tostring(configured.apiBaseUrl))
+    elseif err ~= nil and err.code ~= "custom_api_url_missing" then
+        log("warn", "could not configure API from Ragnarock settings: " .. tostring(err.message or err))
+    end
+end
+
 local state = _G.__ragnaCustomsVoteState or {
     hooksInstalled = false,
     buttonHooksInstalled = false,
@@ -1025,8 +1040,25 @@ local function invokeMember(object, name)
     end
     if member == nil then return nil end
     local direct = safeCall(function() return member(object) end, nil)
-    if direct ~= nil then return direct end
+    -- UE4SS may return another reflected function object when a UFunction
+    -- wrapper is called directly. Only accept a value; otherwise use the
+    -- object's reflected CallFunction path.
+    if direct ~= nil and type(direct) ~= "function" then return direct end
     return safeCall(function() return object:CallFunction(member) end, nil)
+end
+
+local function configureApiFromReflectedGameSettings()
+    if type(Api.configureFromGameCustomApiUrls) ~= "function" then return false end
+    local ok, configured = pcall(Api.configureFromGameCustomApiUrls)
+    if not ok then
+        log("warn", "could not configure API from Ragnarock settings: " .. tostring(configured))
+        return false
+    end
+    if configured ~= nil then
+        log("info", "configured API from Ragnarock CustomApiURLs base=" .. tostring(configured.apiBaseUrl))
+        return true
+    end
+    return false
 end
 
 local function objectValue(object, names)
@@ -1274,6 +1306,11 @@ end
 
 local function resolveCatalogId(folder, metadata, generation)
     if folder == nil or metadata == nil or state.resolutionPending then return end
+    local settingsOk, configured = pcall(configureApiFromReflectedGameSettings)
+    if not settingsOk then configured = false end
+    if not configured then
+        configureApiFromGameSettings()
+    end
     state.resolutionPending = true
     local function finish(id, message)
         if generation ~= state.resolutionGeneration then return end
@@ -1301,10 +1338,12 @@ local function resolveCatalogId(folder, metadata, generation)
         finish(nil, "RagnaCustomsApi does not provide discoverInstalledSongId")
         return
     end
-    Api.discoverInstalledSongId(folder, metadata, {
+    log("info", "discovering catalog ID through RagnaCustomsApi version=" .. tostring(Api.VERSION))
+    local discoveryRequest = Api.discoverInstalledSongId(folder, metadata, {
         existingId = cached,
         callback = discovered,
     })
+    log("info", "catalog discovery request returned type=" .. type(discoveryRequest))
 end
 
 local function resolvePlayedSongState(manager)
