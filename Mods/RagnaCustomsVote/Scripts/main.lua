@@ -11,7 +11,16 @@ local function log(level, message)
 end
 
 local function loadApiDependency()
-    if type(Api) == "table" and type(Api.getWanApiVote) == "function" and type(Api.setWanApiVote) == "function" then
+    if type(Api) == "table"
+        and type(Api.getSongVote) == "function"
+        and type(Api.upvote) == "function"
+        and type(Api.downvote) == "function"
+        and type(Api.readInstalledSongId) == "function"
+        and type(Api.writeInstalledSongId) == "function"
+        and type(Api.discoverInstalledSongId) == "function"
+        and type(Api.search) == "function"
+        and type(Api.getSong) == "function"
+        and type(Api.on) == "function" then
         return Api
     end
 
@@ -32,18 +41,47 @@ local function loadApiDependency()
 end
 
 Api = loadApiDependency()
-if type(Api) ~= "table" or type(Api.getWanApiVote) ~= "function" or type(Api.setWanApiVote) ~= "function" then
-    log("error", "RagnaCustomsApi >= 0.2.0 is required")
+if type(Api) ~= "table"
+    or type(Api.getSongVote) ~= "function"
+    or type(Api.upvote) ~= "function"
+    or type(Api.downvote) ~= "function"
+    or type(Api.readInstalledSongId) ~= "function"
+    or type(Api.writeInstalledSongId) ~= "function"
+    or type(Api.discoverInstalledSongId) ~= "function"
+    or type(Api.search) ~= "function"
+    or type(Api.getSong) ~= "function"
+    or type(Api.on) ~= "function" then
+    log("error", "RagnaCustomsApi >= 0.3.0 is required")
     return
 end
 
--- This consumer explicitly opts into Ragnarock's canonical WanApi contract.
-Api.configure({ useWanApi = true })
+-- The 0.3 API uses its documented catalog transport and numeric song IDs.
+Api.configure({ preferApi = true, transport = "varest" })
+
+local function configureApiFromGameSettings()
+    if type(Api.configureFromGameCustomApiUrls) ~= "function" then return end
+    local ok, configured, err = pcall(function()
+        return Api.configureFromGameCustomApiUrls()
+    end)
+    if not ok then
+        configured, err = nil, { code = "configuration_failed", message = configured }
+    end
+    if configured ~= nil then
+        log("info", "configured API from Ragnarock CustomApiURLs base=" .. tostring(configured.apiBaseUrl))
+    elseif err ~= nil and err.code ~= "custom_api_url_missing" then
+        log("warn", "could not configure API from Ragnarock settings: " .. tostring(err.message or err))
+    end
+end
 
 local state = _G.__ragnaCustomsVoteState or {
     hooksInstalled = false,
     buttonHooksInstalled = false,
     beatmap = nil,
+    songId = nil,
+    songFolder = nil,
+    songMetadata = nil,
+    resolutionKey = nil,
+    resolutionPending = false,
     custom = nil,
     panelPath = nil,
     mode = nil,
@@ -57,6 +95,8 @@ local state = _G.__ragnaCustomsVoteState or {
     createFailedPath = nil,
     error = nil,
     pressed = { up = false, down = false },
+    apiEventsInstalled = false,
+    renderQueued = false,
 }
 _G.__ragnaCustomsVoteState = state
 state.diagnostics = state.diagnostics or {}
@@ -507,9 +547,7 @@ local function makeButton(canvas, context, mode, label, geometry)
         root:SetRenderOpacity(1.0)
         root:SetRenderTransformTranslation({ X = 0.0, Y = 0.0 })
     end, nil)
-    local attached = mode == "flat"
-        and addButtonToCanvas(canvas, root, geometry)
-        or addToCanvas(canvas, root, geometry)
+    local attached = addToCanvas(canvas, root, geometry)
     if not attached then
         log("error", "failed to attach Results button widget label=" .. tostring(label))
         return nil
@@ -557,8 +595,11 @@ end
 
 local COLORS = {
     normal = { R = 0.82, G = 0.86, B = 0.92, A = 1.0 },
+    normalFocused = { R = 0.96, G = 0.98, B = 1.0, A = 1.0 },
     up = { R = 0.25, G = 1.0, B = 0.42, A = 1.0 },
+    upFocused = { R = 0.58, G = 1.0, B = 0.70, A = 1.0 },
     down = { R = 1.0, G = 0.32, B = 0.32, A = 1.0 },
+    downFocused = { R = 1.0, G = 0.60, B = 0.58, A = 1.0 },
     disabled = { R = 0.52, G = 0.56, B = 0.62, A = 1.0 },
 }
 
@@ -582,19 +623,45 @@ local function removeWidgets()
     state.vrOverlayComponent = nil
     state.widgets = nil
     state.panelPath = nil
+    state.loadedSongId = nil
     state.phase = "hidden"
     state.pressed = { up = false, down = false }
 end
 
-local function render()
+local function renderNow()
     local widgets = state.widgets
     if widgets == nil then
         return
     end
-    local upColor = state.currentVote == "up" and COLORS.up or COLORS.normal
-    local downColor = state.currentVote == "down" and COLORS.down or COLORS.normal
-    safeCall(function() widgets.up.button:SetColorAndOpacity(upColor) end, nil)
-    safeCall(function() widgets.down.button:SetColorAndOpacity(downColor) end, nil)
+    local function isHighlighted(entry)
+        local target = valid(entry.innerButton) and entry.innerButton or entry.button
+        return safeCall(function() return target:IsHovered() end, false)
+            or safeCall(function() return target:HasKeyboardFocus() end, false)
+    end
+    local function voteColor(direction, entry)
+        local highlighted = isHighlighted(entry)
+        if direction == "up" then
+            return highlighted and COLORS.upFocused or COLORS.up
+        elseif direction == "down" then
+            return highlighted and COLORS.downFocused or COLORS.down
+        end
+        return highlighted and COLORS.normalFocused or COLORS.normal
+    end
+    local upColor = state.currentVote == "up"
+        and voteColor("up", widgets.up) or voteColor("normal", widgets.up)
+    local downColor = state.currentVote == "down"
+        and voteColor("down", widgets.down) or voteColor("normal", widgets.down)
+    local function applyButtonColor(entry, color)
+        -- The generated Results widget is only a wrapper. Focus and hover
+        -- styling is applied by its nested UButton, so coloring the wrapper
+        -- alone is lost as soon as Slate leaves the focused state.
+        safeCall(function() entry.button:SetColorAndOpacity(color) end, nil)
+        if valid(entry.innerButton) then
+            safeCall(function() entry.innerButton:SetColorAndOpacity(color) end, nil)
+        end
+    end
+    applyButtonColor(widgets.up, upColor)
+    applyButtonColor(widgets.down, downColor)
     local enabled = state.phase == "ready"
     safeCall(function()
         widgets.up.button:SetIsEnabled(enabled)
@@ -615,6 +682,20 @@ local function render()
         setText(widgets.down.text, "▼ " .. tostring(state.downvotes or 0))
     end
     if widgets.status ~= nil then setText(widgets.status.text, status) end
+end
+
+local function render()
+    if state.renderQueued then return end
+    state.renderQueued = true
+    local apply = function()
+        state.renderQueued = false
+        renderNow()
+    end
+    if type(ExecuteInGameThread) == "function" then
+        ExecuteInGameThread(apply)
+    else
+        apply()
+    end
 end
 
 local function applyResponse(result)
@@ -658,14 +739,56 @@ local function applyResponse(result)
     else
         repaint()
     end
+    render()
+end
+
+local function apiVoteResult(responseState, error)
+    if error ~= nil then
+        return { ok = false, error = error }
+    end
+    local upvotes = type(responseState) == "table" and tonumber(responseState.upvotes) or nil
+    local downvotes = type(responseState) == "table" and tonumber(responseState.downvotes) or nil
+    if upvotes == nil or downvotes == nil then
+        return { ok = false, error = { code = "invalid_response", message = "vote response is missing counts" } }
+    end
+    local currentVote = responseState.currentVote
+    if currentVote ~= nil and currentVote ~= "up" and currentVote ~= "down" then
+        return { ok = false, error = { code = "invalid_response", message = "vote response contains an invalid selection" } }
+    end
+    return {
+        ok = true,
+        state = { currentVote = currentVote, upvotes = upvotes, downvotes = downvotes },
+    }
+end
+
+local function installApiEventHandlers()
+    if state.apiEventsInstalled then return end
+    state.apiEventsInstalled = true
+    Api.on("vote.details.completed", function(payload)
+        if payload == nil or tostring(payload.id) ~= tostring(state.songId) then return end
+        applyResponse(apiVoteResult(payload.response, nil))
+    end)
+    Api.on("vote.details.failed", function(payload)
+        if payload == nil or tostring(payload.id) ~= tostring(state.songId) then return end
+        applyResponse(apiVoteResult(nil, payload.error))
+    end)
+    Api.on("vote.completed", function(payload)
+        if payload == nil or tostring(payload.id) ~= tostring(state.songId) then return end
+        applyResponse(apiVoteResult(payload.response, nil))
+    end)
+    Api.on("vote.failed", function(payload)
+        if payload == nil or tostring(payload.id) ~= tostring(state.songId) then return end
+        applyResponse(apiVoteResult(nil, payload.error))
+    end)
 end
 
 local function loadVote()
     state.phase = "loading"
     render()
-    local _, err = Api.getWanApiVote(state.beatmap, applyResponse)
+    installApiEventHandlers()
+    local _, err = Api.getSongVote(state.songId)
     if err ~= nil then
-        applyResponse({ ok = false, error = { code = "start_failed", message = err } })
+        applyResponse(apiVoteResult(nil, { code = "start_failed", message = err }))
     end
 end
 
@@ -674,16 +797,19 @@ local function submit(direction)
         return
     end
     local desired = direction
-    if state.currentVote == direction then
-        desired = nil
-    end
     log("info", "vote submit current=" .. tostring(state.currentVote)
         .. " requested=" .. tostring(direction) .. " desired=" .. tostring(desired))
     state.phase = "submitting"
     render()
-    local _, err = Api.setWanApiVote(state.beatmap, desired, applyResponse)
+    installApiEventHandlers()
+    local _, err
+    if desired == "up" then
+        _, err = Api.upvote(state.songId)
+    else
+        _, err = Api.downvote(state.songId)
+    end
     if err ~= nil then
-        applyResponse({ ok = false, error = { code = "start_failed", message = err } })
+        applyResponse(apiVoteResult(nil, { code = "start_failed", message = err }))
     end
 end
 
@@ -781,6 +907,7 @@ local function createVrWidgets(panelPath)
     state.downvotes = 0
     log("info", "created VR Results vote buttons on ScoreboardWidget root surface")
     installButtonHooks()
+    state.loadedSongId = state.songId
     loadVote()
     return true
 end
@@ -795,33 +922,14 @@ local function createFlatWidgets(panel, panelPath)
         return false
     end
     local buttonWidth, buttonHeight = 96, 42
-    local voteHeight = 112
-    local geometry = {
-        x = 530,
-        y = 17,
-        width = 108,
-        height = voteHeight,
-        anchorRight = true,
-    }
-    -- Use the UserWidget as the UObject outer; constructing a CanvasPanel with
-    -- the live VR CanvasPanel outer can stall UE4SS on this build.
-    local widgetOuter = panel
-    local container = construct("/Script/UMG.CanvasPanel", widgetOuter)
-    log("info", "vote panel construct container begin")
-    local containerAttached = valid(container) and addToCanvas(canvas, container, geometry) or false
-    if not containerAttached then
-        if not state.diagnostics.containerFailed then
-            state.diagnostics.containerFailed = true
-            log("error", "failed to construct or attach standalone Results vote panel")
-        end
-        return false
-    end
-    log("info", "vote panel construct container done")
+    -- Attach the owned buttons directly to the existing SongInfo surface.
+    -- Creating an intermediate CanvasPanel and adding it to this live tree can
+    -- stall UE4SS on the current build.
     log("info", "vote panel construct up begin")
     local buttonContext = panel
-    local buttons = createVoteButtons(container, buttonContext, "flat", {
-        { direction = "up", label = "▲ 0", geometry = { x = 6, y = 7, width = buttonWidth, height = buttonHeight, z = 2 } },
-        { direction = "down", label = "▼ 0", geometry = { x = 6, y = 63, width = buttonWidth, height = buttonHeight, z = 2 } },
+    local buttons = createVoteButtons(canvas, buttonContext, "flat", {
+        { direction = "up", label = "▲ 0", geometry = { x = 530, y = 24, width = buttonWidth, height = buttonHeight, z = 9000 } },
+        { direction = "down", label = "▼ 0", geometry = { x = 530, y = 80, width = buttonWidth, height = buttonHeight, z = 9001 } },
     })
     log("info", "vote panel construct up done")
     log("info", "vote panel construct down done")
@@ -830,15 +938,14 @@ local function createFlatWidgets(panel, panelPath)
             state.diagnostics.buttonsFailed = true
             log("error", "failed to construct or attach Results vote buttons")
         end
-        safeCall(function() if valid(container) then container:RemoveFromParent() end end, nil)
         return false
     end
     safeCall(function()
-        up.button:SetIsEnabled(false)
-        down.button:SetIsEnabled(false)
+        buttons.up.button:SetIsEnabled(false)
+        buttons.down.button:SetIsEnabled(false)
     end, nil)
     state.widgets = {
-        container = container,
+        container = nil,
         status = nil,
         up = buttons.up,
         down = buttons.down,
@@ -851,6 +958,7 @@ local function createFlatWidgets(panel, panelPath)
     state.downvotes = 0
     log("info", "created standalone flat Results vote panel")
     installButtonHooks()
+    state.loadedSongId = state.songId
     loadVote()
     return true
 end
@@ -931,42 +1039,446 @@ local function findPlayedSongManager()
     return nil
 end
 
-local function resolvePlayedSongState(manager)
-    if not valid(manager) then
+local function extractSongId(value)
+    value = unwrap(value)
+    if value == nil then return nil end
+    local numeric = tonumber(value)
+    if numeric ~= nil and numeric > 0 then
+        return math.floor(numeric)
+    end
+    local text = tostring(value):gsub("\\", "/")
+    local id = text:match("ragnac://install/(%d+)")
+        or text:match("/songs/[^/]+/(%d+)")
+        or text:match("/song/(%d+)")
+        or text:match("/CustomSongs/(%d+)")
+        or text:match("/(%d+)/?$")
+        or text:match("[%W_]id[%W_]*(%d+)")
+    return id and tonumber(id) or nil
+end
+
+local function textValue(value)
+    if value == nil then return nil end
+    if type(value) == "string" then return value:gsub("^%s+", ""):gsub("%s+$", "") end
+    if type(value) == "number" or type(value) == "boolean" then return tostring(value) end
+    local valueType = tostring(safeCall(function() return value:type() end, ""))
+    if valueType == "RemoteUnrealParam" or valueType == "LocalUnrealParam" then
+        local inner = safeCall(function() return value:get() end, nil)
+        if inner ~= nil and inner ~= value then return textValue(inner) end
+    elseif valueType == "FString" or valueType == "FText" then
+        return safeCall(function() return value:ToString() end, nil)
+    end
+    return nil
+end
+
+local function invokeMember(object, name)
+    if object == nil or type(object.CallFunction) ~= "function" then return nil end
+    local member = safeCall(function() return object[name] end, nil)
+    if member == nil and type(StaticFindObject) == "function" then
+        local class = safeCall(function() return object:GetClass() end, nil)
+        local className = tostring(fullName(class or "")):gsub("^Class ", "")
+        if className ~= "" then
+            member = safeCall(function()
+                return StaticFindObject("Function " .. className .. ":" .. name)
+            end, nil)
+        end
+    end
+    if member == nil then return nil end
+    local direct = safeCall(function() return member(object) end, nil)
+    -- UE4SS may return another reflected function object when a UFunction
+    -- wrapper is called directly. Only accept a value; otherwise use the
+    -- object's reflected CallFunction path.
+    if direct ~= nil and type(direct) ~= "function" then return direct end
+    return safeCall(function() return object:CallFunction(member) end, nil)
+end
+
+local function configureApiFromReflectedGameSettings()
+    if type(Api.configureFromGameCustomApiUrls) ~= "function" then return false end
+    local ok, configured = pcall(Api.configureFromGameCustomApiUrls)
+    if not ok then
+        log("warn", "could not configure API from Ragnarock settings: " .. tostring(configured))
         return false
     end
-    local song = safeCall(function()
+    if configured ~= nil then
+        log("info", "configured API from Ragnarock CustomApiURLs base=" .. tostring(configured.apiBaseUrl))
+        return true
+    end
+    return false
+end
+
+local function objectValue(object, names)
+    if object == nil then return nil end
+    for _, name in ipairs(names or {}) do
+        local value = safeCall(function()
+            if name:sub(1, 1) == "@" then
+                return object:GetPropertyValue(name:sub(2))
+            end
+            local member = object[name]
+            if type(member) == "function" then return member(object) end
+            if member ~= nil and tostring(fullName(member)):match("^Function ") then
+                return invokeMember(object, name)
+            end
+            return member
+        end, nil)
+        value = unwrap(value)
+        if value ~= nil and type(value) ~= "string" and type(value) ~= "number"
+            and type(value) ~= "boolean" and type(value) ~= "function" and valid(value) then
+            local name = fullName(value)
+            if not name:match("^Function ") then return value end
+        end
+    end
+    return nil
+end
+
+local function relatedSong(object)
+    local direct = invokeMember(object, "GetSong")
+    if direct ~= nil and type(direct) ~= "function" and valid(direct) then
+        return direct
+    end
+    return objectValue(object, {
+        "GetSong", "Song", "m_song", "SongData", "m_songData", "GetSongData",
+        "GetSongInfo", "SongInfo", "m_songInfo", "@Song", "@SongData",
+    })
+end
+
+local function property(object, names)
+    if object == nil then return nil end
+    for _, name in ipairs(names or {}) do
+        local value = safeCall(function()
+            if name:sub(1, 1) == "@" then
+                return object:GetPropertyValue(name:sub(2))
+            end
+            local member = object[name]
+            if type(member) == "function" then return member(object) end
+            if member ~= nil and tostring(fullName(member)):match("^Function ") then
+                return invokeMember(object, name)
+            end
+            return member
+        end, nil)
+        local text = textValue(value)
+        if text ~= nil and text ~= "" and text ~= "None" then return text end
+    end
+    return nil
+end
+
+local function loadedSongFolder(object)
+    local candidates = {
+        state.liveSongPath,
+    }
+    if object ~= nil and not state.diagnostics.pathFunctionProbe then
+        state.diagnostics.pathFunctionProbe = true
+        local getterNames = { "GetPath" }
+        for _, getterName in ipairs(getterNames) do
+            local raw = safeCall(function() return invokeMember(object, getterName) end, nil)
+            local candidate = textValue(raw)
+            if candidate ~= nil and candidate ~= "" then
+                table.insert(candidates, candidate)
+                log("info", "live song path getter=" .. getterName .. " value=" .. candidate)
+            end
+        end
+    end
+    for candidateIndex, candidate in ipairs(candidates) do
+        local path = type(candidate) == "string" and candidate:gsub("\\", "/"):gsub("/+", "/") or nil
+        if (state.diagnostics.pathProbeCount or 0) < 16 then
+            state.diagnostics.pathProbeCount = (state.diagnostics.pathProbeCount or 0) + 1
+            log("info", "live song path candidate=" .. tostring(candidateIndex) .. "=" .. tostring(path))
+        end
+        local lower = path and string.lower(path) or ""
+        local marker = lower:find("/customsongs/", 1, true) or lower:find("customsongs/", 1, true)
+        if marker ~= nil then
+            local markerText = lower:sub(marker, marker + #"customsongs/" - 1):find("customsongs/", 1, true) == 1 and "customsongs/" or "/customsongs/"
+            local rest = path:sub(marker + #markerText)
+            local slash = rest:find("/", 1, true)
+            path = slash and path:sub(1, marker + #markerText + slash - 1) or path
+            if path:sub(-1) == "/" then path = path:sub(1, -2) end
+            if path:lower():match("%.dat$") or path:lower():match("%.json$") then
+                path = path:match("^(.+)/[^/]+$")
+            end
+            if path ~= nil and path ~= "" then return path end
+        end
+    end
+    state.diagnostics.pathProbe = true
+    local nested = relatedSong(object)
+    if nested ~= nil and nested ~= object then
+        return loadedSongFolder(nested)
+    end
+    return nil
+end
+
+local function listProperty(object, names)
+    local value = nil
+    for _, name in ipairs(names or {}) do
+        value = safeCall(function()
+            if name:sub(1, 1) == "@" then return object:GetPropertyValue(name:sub(2)) end
+            local member = object[name]
+            if member ~= nil and tostring(fullName(member)):match("^Function ") then
+                return invokeMember(object, name)
+            end
+            return member
+        end, nil)
+        if value ~= nil then break end
+    end
+    local result = {}
+    if value ~= nil and type(value) == "table" then
+        for _, entry in ipairs(value) do table.insert(result, entry) end
+    else
+        local forEach = value ~= nil and safeCall(function() return value.ForEach end, nil) or nil
+        if type(forEach) ~= "function" then return result end
+        safeCall(function() value:ForEach(function(entry) table.insert(result, entry) end) end, nil)
+    end
+    return result
+end
+
+local function songMetadata(song, beatMap)
+    if false then
+        state.diagnostics.getterProbe = true
+        for _, name in ipairs({ "GetPath", "GetName", "GetBand", "GetLevelAuthor", "GetBeatMapsLevels" }) do
+            local raw = invokeMember(song, name)
+            log("info", "live getter probe name=" .. name .. " raw=" .. tostring(raw)
+                .. " type=" .. type(raw) .. " valueType=" .. tostring(safeCall(function() return raw:type() end, nil))
+                .. " tostring=" .. tostring(safeCall(function() return raw:ToString() end, nil))
+                .. " get=" .. tostring(safeCall(function() return raw:get() end, nil))
+                .. " text=" .. tostring(textValue(raw)))
+            if type(raw) == "table" then
+                for index, entry in ipairs(raw) do
+                    if index <= 16 then
+                        log("info", "live getter table name=" .. name .. " index=" .. tostring(index)
+                            .. " entry=" .. tostring(entry) .. " entryType=" .. type(entry)
+                            .. " valueType=" .. tostring(safeCall(function() return entry:type() end, nil))
+                            .. " get=" .. tostring(safeCall(function() return entry:get() end, nil))
+                            .. " Get=" .. tostring(safeCall(function() return entry:Get() end, nil))
+                            .. " text=" .. tostring(textValue(entry)))
+                    end
+                end
+            end
+        end
+    end
+    local metadata = {
+        title = property(song, { "GetName", "Title", "@Title", "@Name" })
+            or property(beatMap, { "Title", "@Title", "@Name" }),
+        artist = property(song, { "GetBand", "Artist", "AuthorName", "@Artist", "@ArtistName", "@AuthorName" })
+            or property(beatMap, { "Artist", "AuthorName", "@Artist", "@ArtistName", "@AuthorName" }),
+        mapper = property(song, { "GetLevelAuthor", "LevelAuthorName", "Mapper", "@LevelAuthorName", "@Mapper" })
+            or property(beatMap, { "LevelAuthorName", "Mapper", "@LevelAuthorName", "@Mapper" }),
+        difficulties = listProperty(song, { "GetBeatMapsLevels", "@BeatMaps", "@Levels", "@Difficulties" }),
+    }
+    local values = listProperty(song, { "GetBeatMapsLevels", "@BeatMaps", "@Levels", "@Difficulties" })
+    metadata.difficulties = {}
+    for _, map in ipairs(values) do
+        local rankObject = objectValue(map, {
+            "GetDifficultyRank", "DifficultyRank", "m_difficultyRank", "@DifficultyRank", "@m_difficultyRank",
+        })
+        local level = property(rankObject, { "GetLevel", "m_level", "Level", "@Level" })
+            or property(map, { "GetDifficultyRankLevel", "DifficultyRankLevel", "@DifficultyRankLevel" })
+            or property(map, { "GetLevel", "m_level", "Level", "@Level" })
+            or safeCall(function() return map:get() end, nil)
+            or textValue(map)
+        if level ~= nil then table.insert(metadata.difficulties, level) end
+    end
+    if #metadata.difficulties == 0 and beatMap ~= nil then
+        local rankObject = objectValue(beatMap, {
+            "GetDifficultyRank", "DifficultyRank", "m_difficultyRank", "@DifficultyRank", "@m_difficultyRank",
+        })
+        local level = property(rankObject, { "GetLevel", "m_level", "Level", "@Level" })
+            or property(beatMap, { "GetDifficultyRankLevel", "DifficultyRankLevel", "@DifficultyRankLevel" })
+            or property(beatMap, { "GetLevel", "m_level", "Level", "@Level" })
+        if level ~= nil then table.insert(metadata.difficulties, level) end
+    end
+    return metadata
+end
+
+local function probeLiveProperties(object, label, names)
+    if object == nil then return end
+    for _, name in ipairs(names or {}) do
+        local value = safeCall(function() return object:GetPropertyValue(name) end, nil)
+        local direct = safeCall(function() return object[name] end, nil)
+        if value ~= nil then
+            local text = textValue(value)
+            log("info", "live property probe object=" .. label .. " name=" .. name
+                .. " raw=" .. tostring(value) .. " type=" .. type(value)
+                .. " direct=" .. tostring(direct) .. " directType=" .. type(direct)
+                .. " text=" .. tostring(text))
+        end
+    end
+    local class = safeCall(function() return object:GetClass() end, nil)
+    log("info", "live reflected class object=" .. label .. " class=" .. tostring(class) .. " className=" .. tostring(fullName(class)))
+    if class ~= nil then
+        local count = 0
+        local visited = 0
+        while valid(class) and visited < 12 and count < 160 do
+            visited = visited + 1
+            safeCall(function()
+                class:ForEachProperty(function(prop)
+                    count = count + 1
+                    if count <= 160 then
+                        local propName = safeCall(function() return prop:GetFullName() end, nil)
+                            or safeCall(function() return prop:GetName() end, nil)
+                        local shortName = tostring(propName or ""):match("([^%.:]+)$") or tostring(propName or "")
+                        local raw = safeCall(function() return object:GetPropertyValue(shortName) end, nil)
+                        local directValue = safeCall(function() return object[shortName] end, nil)
+                        log("info", "live reflected property object=" .. label
+                            .. " name=" .. tostring(shortName)
+                            .. " raw=" .. tostring(raw) .. " rawType=" .. type(raw)
+                            .. " direct=" .. tostring(directValue) .. " directType=" .. type(directValue)
+                            .. " text=" .. tostring(textValue(raw) or textValue(directValue)))
+                    end
+                    return false
+                end)
+            end, nil)
+            class = safeCall(function() return class:GetSuperStruct() end, nil)
+        end
+        log("info", "live reflected property count object=" .. label .. " count=" .. tostring(count))
+        local functionCount = 0
+        class = safeCall(function() return object:GetClass() end, nil)
+        visited = 0
+        while valid(class) and visited < 12 and functionCount < 240 do
+            visited = visited + 1
+            safeCall(function()
+                class:ForEachFunction(function(fn)
+                    functionCount = functionCount + 1
+                    if functionCount <= 240 then
+                        log("info", "live reflected function object=" .. label
+                            .. " name=" .. tostring(safeCall(function() return fn:GetFullName() end, nil)
+                                or safeCall(function() return fn:GetName() end, nil)))
+                    end
+                end)
+            end, nil)
+            class = safeCall(function() return class:GetSuperStruct() end, nil)
+        end
+        log("info", "live reflected function count object=" .. label .. " count=" .. tostring(functionCount))
+    end
+end
+
+local function resolveCatalogId(folder, metadata, generation)
+    if folder == nil or metadata == nil or state.resolutionPending then return end
+    local settingsOk, configured = pcall(configureApiFromReflectedGameSettings)
+    if not settingsOk then configured = false end
+    if not configured then
+        configureApiFromGameSettings()
+    end
+    state.resolutionPending = true
+    local function finish(id, message)
+        if generation ~= state.resolutionGeneration then return end
+        state.resolutionPending = false
+        if id ~= nil then
+            state.songId = tonumber(id)
+            log("info", message .. " id=" .. tostring(state.songId))
+        end
+    end
+    local cached = type(Api.readInstalledSongId) == "function" and safeCall(function() return Api.readInstalledSongId(folder) end, nil) or nil
+    local function discovered(id, err, result)
+        if err ~= nil then
+            finish(nil, "catalog discovery failed: " .. tostring(err.message or err))
+            return
+        end
+        local status = result and result.status or "resolved"
+        local messages = {
+            validated = "validated loaded song .id against metadata search",
+            replaced = "replaced invalid loaded song .id from metadata search",
+            resolved = "resolved loaded song by metadata search and cached",
+        }
+        finish(id, messages[status] or messages.resolved)
+    end
+    if type(Api.discoverInstalledSongId) ~= "function" then
+        finish(nil, "RagnaCustomsApi does not provide discoverInstalledSongId")
+        return
+    end
+    log("info", "discovering catalog ID through RagnaCustomsApi version=" .. tostring(Api.VERSION))
+    local discoveryRequest = Api.discoverInstalledSongId(folder, metadata, {
+        existingId = cached,
+        callback = discovered,
+    })
+    log("info", "catalog discovery request returned type=" .. type(discoveryRequest))
+end
+
+local function resolvePlayedSongState(manager)
+    if not valid(manager) and not valid(state.liveBeatMap) then
+        return false
+    end
+    local song = valid(manager) and safeCall(function()
         return manager:GetSong()
     end, safeCall(function()
         return manager.m_song
-    end, nil))
-    local beatMap = safeCall(function()
+    end, nil)) or state.liveSong or relatedSong(state.liveBeatMap)
+    local beatMap = valid(manager) and safeCall(function()
         return manager:GetBeatMap()
     end, safeCall(function()
         return manager.m_beatMap
-    end, nil))
+    end, nil)) or state.liveBeatMap
+    log("info", "live song objects manager=" .. tostring(valid(manager) and fullName(manager) or "nil")
+        .. " song=" .. tostring(song ~= nil and fullName(song) or "nil")
+        .. " beatMap=" .. tostring(beatMap ~= nil and fullName(beatMap) or "nil"))
+    -- Capture the live hash before consulting the installed catalog. On the
+    -- first Results poll state.beatmap is usually still empty; resolving the
+    -- catalog before filling it leaves the one-shot capture marked complete
+    -- and prevents the fixture's .id marker from ever being used.
+    if beatMap ~= nil and state.beatmap == nil then
+        local beatMapHash = safeCall(function() return beatMap:GetHash() end, nil)
+        state.beatmap = extractHash(beatMapHash)
+    end
+    log("info", "song resolution probe beatmap=" .. tostring(state.beatmap)
+        .. " beatMap=" .. tostring(beatMap))
     local rawCustom = song and safeCall(function()
         return song:IsCustom()
     end, nil) or nil
+    local folderOk, folder = pcall(function()
+        return loadedSongFolder(song) or loadedSongFolder(beatMap) or loadedSongFolder(manager)
+    end)
+    if not folderOk then
+        log("warn", "live song folder resolver error=" .. tostring(folder))
+        folder = nil
+    end
+    local metadata = safeCall(function() return songMetadata(song, beatMap) end, {
+        title = nil,
+        artist = nil,
+        mapper = nil,
+        difficulties = {},
+    })
+    if false then
+        state.diagnostics.livePropertiesProbed = true
+        probeLiveProperties(song, "Song", {
+            "Title", "SongTitle", "SongName", "Name", "Artist", "ArtistName", "AuthorName",
+            "Mapper", "LevelAuthorName", "SongPath", "FolderPath", "CustomSongPath", "FilePath",
+            "m_title", "m_songName", "m_name", "m_artist", "m_authorName", "m_mapper", "m_songPath", "m_folderPath",
+        })
+        probeLiveProperties(beatMap, "BeatMap", {
+            "Title", "SongTitle", "SongName", "Name", "Artist", "ArtistName", "AuthorName",
+            "Mapper", "LevelAuthorName", "SongPath", "FolderPath", "CustomSongPath", "FilePath",
+            "m_title", "m_songName", "m_name", "m_artist", "m_authorName", "m_mapper", "m_songPath", "m_folderPath",
+            "GetLevel", "Difficulty", "DifficultyRank", "GetDifficultyRank", "m_difficultyRank",
+        })
+    end
+    local difficultyText = {}
+    for _, difficulty in ipairs(metadata.difficulties or {}) do table.insert(difficultyText, tostring(difficulty)) end
+    log("info", "live song metadata folder=" .. tostring(folder)
+        .. " title=" .. tostring(metadata.title)
+        .. " artist=" .. tostring(metadata.artist)
+        .. " mapper=" .. tostring(metadata.mapper)
+        .. " difficulties=" .. table.concat(difficultyText, ","))
+    local key = tostring(folder or "") .. "|" .. tostring(state.beatmap or "")
+    if key ~= state.resolutionKey then
+        state.resolutionKey = key
+        state.resolutionGeneration = (state.resolutionGeneration or 0) + 1
+        state.resolutionPending = false
+        state.songId = nil
+        state.songFolder = folder
+        state.songMetadata = metadata
+        resolveCatalogId(folder, metadata, state.resolutionGeneration)
+    end
     local custom = extractBoolean(rawCustom)
     if custom ~= nil then
         state.custom = custom
     end
-    if beatMap ~= nil then
-        safeCall(function()
-            beatMap:GetHash()
-            return true
-        end, false)
-    end
-    if state.custom ~= nil and state.beatmap ~= nil then
+    if state.custom ~= nil and state.beatmap ~= nil and state.songId ~= nil then
         if not state.diagnostics.playedSongResolved then
             state.diagnostics.playedSongResolved = true
             log("info", "resolved played song from BeatManager custom=" .. tostring(state.custom)
-                .. " beatmap=" .. state.beatmap)
+                .. " beatmap=" .. state.beatmap .. " songId=" .. tostring(state.songId))
         end
         return true
     end
-    return false
+    -- Resolution continues through the API callbacks. Once the live object has
+    -- yielded its folder, do not re-run reflection on every results poll.
+    return state.songFolder ~= nil
 end
 
 extractBoolean = function(...)
@@ -1002,6 +1514,17 @@ local function installHooks()
     state.hooksInstalled = true
     local hashPost = function(...)
         local hash = extractHash(...)
+        for index = 1, select("#", ...) do
+            local candidate = unwrap(select(index, ...))
+            if valid(candidate) and type(candidate) ~= "function" then
+                local name = fullName(candidate)
+                if name:find("BeatMap", 1, true) ~= nil then
+                    state.liveBeatMap = candidate
+                elseif name:find("Song", 1, true) ~= nil then
+                    state.liveSong = candidate
+                end
+            end
+        end
         if hash ~= nil then
             state.beatmap = hash
         end
@@ -1018,9 +1541,33 @@ local function installHooks()
         installHook("/Script/Ragnarock." .. owner .. ":IsCustomSong", function() end, customPost)
     end
     installHook("/Script/Ragnarock.BeatMap:GetHash", function() end, hashPost)
+    local function captureSongStringHook(label)
+        return function(self, ...)
+            for index = 1, select("#", ...) do
+                local value = select(index, ...)
+                local valueType = tostring(safeCall(function() return value:type() end, ""))
+                local text = safeCall(function()
+                    if valueType == "RemoteUnrealParam" then value = value:get() end
+                    if value ~= nil and tostring(safeCall(function() return value:type() end, "")) == "FString" then
+                        return value:ToString()
+                    end
+                    return type(value) == "string" and value or nil
+                end, nil)
+                if text ~= nil and text ~= "" then
+                    local normalizedText = text:gsub("\\", "/")
+                    if normalizedText:lower():find("customsongs/", 1, true) then
+                        state.liveSongPath = normalizedText
+                        log("info", "captured live Song." .. label .. " path=" .. normalizedText)
+                    end
+                end
+            end
+        end
+    end
+    installHook("/Script/Ragnarock.Song:SetPath", function() end, captureSongStringHook("SetPath"))
+    installHook("/Script/Ragnarock.Song:Setup", function() end, captureSongStringHook("Setup"))
 end
 
-_G.RagnaCustomsVoteSetBeatmapHash = function(hash, isCustom)
+_G.RagnaCustomsVoteSetBeatmapHash = function(hash, isCustom, songId)
     state.beatmap = hash and extractHash(hash) or nil
     state.custom = isCustom == true
 end
@@ -1035,11 +1582,12 @@ local function poll()
     if panel ~= nil then
         manager, managerName = findPlayedSongManager()
     end
-    if panel ~= nil and manager ~= nil and not state.captureQueued
-        and (state.captureManagerPath ~= managerName or state.captureResolved ~= true) then
+    local liveObjectPath = managerName or (valid(state.liveBeatMap) and fullName(state.liveBeatMap) or nil)
+    if panel ~= nil and (manager ~= nil or valid(state.liveBeatMap)) and not state.captureQueued
+        and (state.captureManagerPath ~= liveObjectPath or state.captureResolved ~= true) then
         state.captureQueued = true
         local function captureOnGameThread()
-            state.captureManagerPath = managerName
+            state.captureManagerPath = liveObjectPath
             state.captureResolved = resolvePlayedSongState(manager)
             state.captureQueued = false
         end
@@ -1074,10 +1622,12 @@ local function poll()
         state.lastLoggedCustomScoresAllowed = state.customScoresAllowed
         log("info", "custom score sending allowed=" .. tostring(state.customScoresAllowed))
     end
-    if panel == nil or state.custom ~= true or state.beatmap == nil or state.customScoresAllowed ~= true then
+    if panel == nil or state.custom ~= true or state.beatmap == nil
+        or state.songId == nil or state.customScoresAllowed ~= true then
         local reason = panel == nil and "no_results_panel"
             or state.custom ~= true and "song_not_custom"
             or state.beatmap == nil and "beatmap_unresolved"
+            or state.songId == nil and "song_id_unresolved"
             or "custom_score_sending_disabled"
         if reason ~= state.lastSuppressionReason then
             state.lastSuppressionReason = reason
@@ -1099,7 +1649,7 @@ local function poll()
     if state.createFailedPath == path then
         return
     end
-    if state.widgets == nil or state.panelPath ~= path then
+    if state.widgets == nil or state.panelPath ~= path or state.loadedSongId ~= state.songId then
         if state.createQueued then
             return
         end
@@ -1123,6 +1673,9 @@ local function poll()
         end
         return
     end
+    -- Re-apply the base/hover variant on the game thread so Slate focus
+    -- changes are reflected without touching UMG from LoopAsync's worker.
+    render()
 end
 
 installHooks()
