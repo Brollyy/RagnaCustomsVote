@@ -96,6 +96,7 @@ local state = _G.__ragnaCustomsVoteState or {
     error = nil,
     pressed = { up = false, down = false },
     apiEventsInstalled = false,
+    renderQueued = false,
 }
 _G.__ragnaCustomsVoteState = state
 state.diagnostics = state.diagnostics or {}
@@ -594,8 +595,11 @@ end
 
 local COLORS = {
     normal = { R = 0.82, G = 0.86, B = 0.92, A = 1.0 },
+    normalFocused = { R = 0.96, G = 0.98, B = 1.0, A = 1.0 },
     up = { R = 0.25, G = 1.0, B = 0.42, A = 1.0 },
+    upFocused = { R = 0.58, G = 1.0, B = 0.70, A = 1.0 },
     down = { R = 1.0, G = 0.32, B = 0.32, A = 1.0 },
+    downFocused = { R = 1.0, G = 0.60, B = 0.58, A = 1.0 },
     disabled = { R = 0.52, G = 0.56, B = 0.62, A = 1.0 },
 }
 
@@ -624,15 +628,40 @@ local function removeWidgets()
     state.pressed = { up = false, down = false }
 end
 
-local function render()
+local function renderNow()
     local widgets = state.widgets
     if widgets == nil then
         return
     end
-    local upColor = state.currentVote == "up" and COLORS.up or COLORS.normal
-    local downColor = state.currentVote == "down" and COLORS.down or COLORS.normal
-    safeCall(function() widgets.up.button:SetColorAndOpacity(upColor) end, nil)
-    safeCall(function() widgets.down.button:SetColorAndOpacity(downColor) end, nil)
+    local function isHighlighted(entry)
+        local target = valid(entry.innerButton) and entry.innerButton or entry.button
+        return safeCall(function() return target:IsHovered() end, false)
+            or safeCall(function() return target:HasKeyboardFocus() end, false)
+    end
+    local function voteColor(direction, entry)
+        local highlighted = isHighlighted(entry)
+        if direction == "up" then
+            return highlighted and COLORS.upFocused or COLORS.up
+        elseif direction == "down" then
+            return highlighted and COLORS.downFocused or COLORS.down
+        end
+        return highlighted and COLORS.normalFocused or COLORS.normal
+    end
+    local upColor = state.currentVote == "up"
+        and voteColor("up", widgets.up) or voteColor("normal", widgets.up)
+    local downColor = state.currentVote == "down"
+        and voteColor("down", widgets.down) or voteColor("normal", widgets.down)
+    local function applyButtonColor(entry, color)
+        -- The generated Results widget is only a wrapper. Focus and hover
+        -- styling is applied by its nested UButton, so coloring the wrapper
+        -- alone is lost as soon as Slate leaves the focused state.
+        safeCall(function() entry.button:SetColorAndOpacity(color) end, nil)
+        if valid(entry.innerButton) then
+            safeCall(function() entry.innerButton:SetColorAndOpacity(color) end, nil)
+        end
+    end
+    applyButtonColor(widgets.up, upColor)
+    applyButtonColor(widgets.down, downColor)
     local enabled = state.phase == "ready"
     safeCall(function()
         widgets.up.button:SetIsEnabled(enabled)
@@ -653,6 +682,20 @@ local function render()
         setText(widgets.down.text, "▼ " .. tostring(state.downvotes or 0))
     end
     if widgets.status ~= nil then setText(widgets.status.text, status) end
+end
+
+local function render()
+    if state.renderQueued then return end
+    state.renderQueued = true
+    local apply = function()
+        state.renderQueued = false
+        renderNow()
+    end
+    if type(ExecuteInGameThread) == "function" then
+        ExecuteInGameThread(apply)
+    else
+        apply()
+    end
 end
 
 local function applyResponse(result)
@@ -696,6 +739,7 @@ local function applyResponse(result)
     else
         repaint()
     end
+    render()
 end
 
 local function apiVoteResult(responseState, error)
@@ -1629,6 +1673,9 @@ local function poll()
         end
         return
     end
+    -- Re-apply the base/hover variant on the game thread so Slate focus
+    -- changes are reflected without touching UMG from LoopAsync's worker.
+    render()
 end
 
 installHooks()
