@@ -67,7 +67,7 @@ local function configureApiFromGameSettings()
         configured, err = nil, { code = "configuration_failed", message = configured }
     end
     if configured ~= nil then
-        log("info", "configured API from Ragnarock CustomApiURLs base=" .. tostring(configured.apiBaseUrl))
+        log("info", "configured API from Ragnarock Game.ini base=" .. tostring(configured.apiBaseUrl))
     elseif err ~= nil and err.code ~= "custom_api_url_missing" then
         log("warn", "could not configure API from Ragnarock settings: " .. tostring(err.message or err))
     end
@@ -97,9 +97,21 @@ local state = _G.__ragnaCustomsVoteState or {
     pressed = { up = false, down = false },
     apiEventsInstalled = false,
     renderQueued = false,
+    recoveryAttempts = 0,
+    recoveryQueued = false,
+    pendingVote = nil,
+    voteDetailsPending = false,
+    voteDetailsRequest = nil,
+    voteLoadPending = false,
 }
 _G.__ragnaCustomsVoteState = state
 state.diagnostics = state.diagnostics or {}
+state.recoveryAttempts = state.recoveryAttempts or 0
+state.recoveryQueued = state.recoveryQueued or false
+state.pendingVote = state.pendingVote or nil
+state.voteDetailsPending = state.voteDetailsPending or false
+state.voteDetailsRequest = state.voteDetailsRequest or nil
+state.voteLoadPending = state.voteLoadPending or false
 
 local function safeCall(callback, fallback)
     local ok, result = pcall(callback)
@@ -505,6 +517,10 @@ local function makeButton(canvas, context, mode, label, geometry)
         root:SetVisibility(0)
         root:SetRenderOpacity(1.0)
         root:SetIsEnabled(true)
+        -- Keep the generated wrapper from acquiring Slate focus on click.
+        -- Its Blueprint focus state can repaint the nested button yellow even
+        -- when the nested UButton itself is non-focusable.
+        root:SetIsFocusable(false)
     end, nil)
     local child = safeCall(function() return root:GetPropertyValue("Text_") end, nil)
     local childClass = valid(child) and safeCall(function()
@@ -530,10 +546,12 @@ local function makeButton(canvas, context, mode, label, geometry)
             child:SetIsEnabled(true)
         end, nil)
     end
-    local innerButton = safeCall(function() return root:GetPropertyValue("Button_64") end, nil)
-    if valid(innerButton) then
-        log("info", "vote button inner target property=Button_64 path=" .. objectPath(innerButton))
-    end
+    -- Do not reflect into the generated nested Button_64. On this build that
+    -- property can be a stale native reference while the Blueprint wrapper is
+    -- being constructed; reading or mutating it can stall/crash the game.
+    -- The wrapper is the owned input surface and is sufficient for layout,
+    -- tinting, and the class-level press hook.
+    local innerButton = nil
     safeCall(function()
         root:SetRenderTransformPivot({ X = 0.0, Y = 0.0 })
         -- FlatInGameButton's authored content is approximately 300x70. VR
@@ -542,6 +560,8 @@ local function makeButton(canvas, context, mode, label, geometry)
         if mode == "flat" then
             root:SetRenderScale({ X = 0.36, Y = 0.6 })
         else
+            -- Preserve the proven VR hit geometry. The slot is widened below
+            -- so the scaled content fits instead of clipping large counts.
             root:SetRenderScale({ X = 1.32, Y = 1.58 })
         end
         root:SetRenderOpacity(1.0)
@@ -626,6 +646,7 @@ local function removeWidgets()
     state.loadedSongId = nil
     state.phase = "hidden"
     state.pressed = { up = false, down = false }
+    state.pendingVote = nil
 end
 
 local function renderNow()
@@ -647,28 +668,22 @@ local function renderNow()
         end
         return highlighted and COLORS.normalFocused or COLORS.normal
     end
+    local enabled = state.phase == "ready"
+    safeCall(function()
+        widgets.up.button:SetIsEnabled(enabled)
+        widgets.down.button:SetIsEnabled(enabled)
+    end, nil)
     local upColor = state.currentVote == "up"
         and voteColor("up", widgets.up) or voteColor("normal", widgets.up)
     local downColor = state.currentVote == "down"
         and voteColor("down", widgets.down) or voteColor("normal", widgets.down)
     local function applyButtonColor(entry, color)
-        -- The generated Results widget is only a wrapper. Focus and hover
-        -- styling is applied by its nested UButton, so coloring the wrapper
-        -- alone is lost as soon as Slate leaves the focused state.
+        -- Apply tint after SetIsEnabled: UButton rebuilds its Slate state
+        -- when enabled/disabled changes and would otherwise overwrite this.
         safeCall(function() entry.button:SetColorAndOpacity(color) end, nil)
-        if valid(entry.innerButton) then
-            safeCall(function() entry.innerButton:SetColorAndOpacity(color) end, nil)
-        end
     end
     applyButtonColor(widgets.up, upColor)
     applyButtonColor(widgets.down, downColor)
-    local enabled = state.phase == "ready"
-    safeCall(function()
-        widgets.up.button:SetIsEnabled(enabled)
-        widgets.down.button:SetIsEnabled(enabled)
-        if valid(widgets.up.innerButton) then widgets.up.innerButton:SetIsEnabled(enabled) end
-        if valid(widgets.down.innerButton) then widgets.down.innerButton:SetIsEnabled(enabled) end
-    end, nil)
     local status = "Vote for this custom song"
     if state.phase == "loading" then
         status = "Loading votes..."
@@ -678,8 +693,16 @@ local function renderNow()
         status = "Vote unavailable"
     end
     if state.phase ~= "loading" and state.phase ~= "submitting" then
-        setText(widgets.up.text, "▲ " .. tostring(state.upvotes or 0))
-        setText(widgets.down.text, "▼ " .. tostring(state.downvotes or 0))
+        local separator = state.mode == "vr" and "" or " "
+        local function displayCount(value)
+            value = tonumber(value) or 0
+            if state.mode == "vr" and value >= 1000 then
+                return tostring(math.floor((value + 500) / 1000)) .. "k"
+            end
+            return tostring(value)
+        end
+        setText(widgets.up.text, "▲" .. separator .. displayCount(state.upvotes))
+        setText(widgets.down.text, "▼" .. separator .. displayCount(state.downvotes))
     end
     if widgets.status ~= nil then setText(widgets.status.text, status) end
 end
@@ -698,21 +721,58 @@ local function render()
     end
 end
 
-local function applyResponse(result)
+local loadVote
+
+local function applyResponse(result, responseKind)
     if state.widgets == nil then
         return
     end
     if result == nil or result.ok ~= true then
-        state.phase = "error"
         state.error = result and result.error or { code = "unknown_error" }
         log("error", "vote response failed code=" .. tostring(state.error.code)
             .. " message=" .. tostring(state.error.message))
-        render()
+        -- A VaRest request can fail after the server has already applied a
+        -- vote, or its status fallback can observe a transient empty body.
+        -- Never replay the POST: reconcile through the read-only vote
+        -- endpoint instead, then repaint and re-enable the controls.
+        if state.songId ~= nil and state.recoveryAttempts < 2 and not state.recoveryQueued then
+            state.recoveryAttempts = state.recoveryAttempts + 1
+            state.recoveryQueued = true
+            state.phase = "loading"
+            render()
+            local retry = function()
+                state.recoveryQueued = false
+                log("info", "retrying vote state read attempt=" .. tostring(state.recoveryAttempts))
+                loadVote()
+            end
+            if type(ExecuteWithDelay) == "function" then
+                ExecuteWithDelay(750, retry)
+            else
+                retry()
+            end
+        else
+            state.phase = "error"
+            render()
+        end
         return
     end
+    state.recoveryAttempts = 0
+    state.recoveryQueued = false
     state.phase = "ready"
     state.error = nil
-    state.currentVote = result.state.currentVote
+    local currentVote = result.state.currentVote
+    local pendingVote = state.pendingVote
+    if responseKind == "mutation" and currentVote == nil and pendingVote ~= nil then
+        -- Some production mutation responses contain counts but omit
+        -- votes.mine. Preserve the action locally; a second click on the
+        -- same direction still resolves to nil as a normal toggle-off.
+        currentVote = pendingVote.previous == pendingVote.direction
+            and nil or pendingVote.direction
+        log("info", "vote response omitted mine; inferred current=" .. tostring(currentVote)
+            .. " from direction=" .. tostring(pendingVote.direction))
+    end
+    state.pendingVote = nil
+    state.currentVote = currentVote
     state.upvotes = result.state.upvotes
     state.downvotes = result.state.downvotes
     log("info", "vote response applied current=" .. tostring(state.currentVote)
@@ -731,7 +791,8 @@ local function applyResponse(result)
     end
     -- Give the freshly-created Blueprint one rendered tick before touching
     -- its generated TextBlock. Immediate mutation can stall this build.
-    if type(ExecuteWithDelay) == "function" then
+    local scheduleOnGameThread = ExecuteWithDelay
+    if type(scheduleOnGameThread) == "function" then
         ExecuteWithDelay(1000, function()
             log("info", "vote repaint executing after widget settle")
             repaint()
@@ -766,30 +827,40 @@ local function installApiEventHandlers()
     state.apiEventsInstalled = true
     Api.on("vote.details.completed", function(payload)
         if payload == nil or tostring(payload.id) ~= tostring(state.songId) then return end
-        applyResponse(apiVoteResult(payload.response, nil))
+        applyResponse(apiVoteResult(payload.response, nil), "details")
     end)
     Api.on("vote.details.failed", function(payload)
         if payload == nil or tostring(payload.id) ~= tostring(state.songId) then return end
-        applyResponse(apiVoteResult(nil, payload.error))
+        applyResponse(apiVoteResult(nil, payload.error), "details")
     end)
     Api.on("vote.completed", function(payload)
         if payload == nil or tostring(payload.id) ~= tostring(state.songId) then return end
-        applyResponse(apiVoteResult(payload.response, nil))
+        applyResponse(apiVoteResult(payload.response, nil), "mutation")
     end)
     Api.on("vote.failed", function(payload)
         if payload == nil or tostring(payload.id) ~= tostring(state.songId) then return end
-        applyResponse(apiVoteResult(nil, payload.error))
+        applyResponse(apiVoteResult(nil, payload.error), "mutation")
     end)
 end
 
-local function loadVote()
+loadVote = function()
+    state.recoveryQueued = false
     state.phase = "loading"
     render()
     installApiEventHandlers()
-    local _, err = Api.getSongVote(state.songId)
-    if err ~= nil then
-        applyResponse(apiVoteResult(nil, { code = "start_failed", message = err }))
+    local function startRequest()
+        log("info", "vote details request starting")
+        local _, err = Api.getSongVote(state.songId)
+        if err ~= nil then
+            applyResponse(apiVoteResult(nil, { code = "start_failed", message = err }))
+        end
     end
+    state.voteDetailsRequest = nil
+    state.voteDetailsPending = false
+    log("info", "vote details request scheduled timer=" .. tostring(type(ExecuteInGameThreadWithDelay))
+        .. " legacy=" .. tostring(type(ExecuteWithDelay))
+        .. " gameThread=" .. tostring(type(ExecuteInGameThread)))
+    startRequest()
 end
 
 local function submit(direction)
@@ -799,6 +870,10 @@ local function submit(direction)
     local desired = direction
     log("info", "vote submit current=" .. tostring(state.currentVote)
         .. " requested=" .. tostring(direction) .. " desired=" .. tostring(desired))
+    state.pendingVote = {
+        direction = direction,
+        previous = state.currentVote,
+    }
     state.phase = "submitting"
     render()
     installApiEventHandlers()
@@ -835,13 +910,33 @@ local function voteDirectionForClickedButton(...)
             local clickedPath = objectPath(clicked)
             for _, direction in ipairs({ "up", "down" }) do
                 local entry = widgets[direction]
-                if entry ~= nil and clickedPath == entry.objectPath then
+                if entry ~= nil and (clickedPath == entry.objectPath
+                    or (entry.innerObjectPath ~= nil and clickedPath == entry.innerObjectPath)) then
                     return direction
                 end
             end
         end
     end
     return nil
+end
+
+local function resolveDeferredButtonPaths()
+    local widgets = state.widgets
+    if widgets == nil then return end
+    for _, entry in pairs(widgets) do
+        if type(entry) == "table" and entry.innerObjectPath == nil and valid(entry.root) then
+            local nested = safeCall(function()
+                return entry.root:GetPropertyValue("Button_64")
+            end, nil)
+            if nested ~= nil then
+                local path = safeCall(function() return objectPath(nested) end, nil)
+                if path ~= nil then
+                    entry.innerObjectPath = path
+                    log("info", "deferred vote button target path=" .. tostring(path))
+                end
+            end
+        end
+    end
 end
 
 local function installButtonHooks()
@@ -891,8 +986,8 @@ local function createVrWidgets(panelPath)
         return false
     end
     local buttons = createVoteButtons(targetCanvas, context, "vr", {
-        { direction = "up", label = "▲ 0", geometry = { x = 1195, y = 453, width = 300, height = 78, z = 9000 } },
-        { direction = "down", label = "▼ 0", geometry = { x = 1195, y = 542, width = 300, height = 78, z = 9001 } },
+        { direction = "up", label = "▲ 0", geometry = { x = 1195, y = 453, width = 400, height = 78, z = 9000 } },
+        { direction = "down", label = "▼ 0", geometry = { x = 1195, y = 542, width = 400, height = 78, z = 9001 } },
     })
     if buttons == nil then
         log("error", "failed to attach VR vote buttons to ScoreboardWidget")
@@ -908,7 +1003,7 @@ local function createVrWidgets(panelPath)
     log("info", "created VR Results vote buttons on ScoreboardWidget root surface")
     installButtonHooks()
     state.loadedSongId = state.songId
-    loadVote()
+    state.voteLoadPending = true
     return true
 end
 
@@ -959,7 +1054,7 @@ local function createFlatWidgets(panel, panelPath)
     log("info", "created standalone flat Results vote panel")
     installButtonHooks()
     state.loadedSongId = state.songId
-    loadVote()
+    state.voteLoadPending = true
     return true
 end
 
@@ -976,26 +1071,9 @@ end
 local function extractHash(...)
     for index = 1, select("#", ...) do
         local source = select(index, ...)
-        local unwrapped = unwrap(source)
-        local direct = safeCall(function()
-            return source:get()
-        end, nil)
-        local values = {
-            unwrapped,
-            direct,
-            safeCall(function()
-                return unwrapped:ToString()
-            end, nil),
-            safeCall(function()
-                return direct:ToString()
-            end, nil),
-            safeCall(function()
-                return source:ToString()
-            end, nil),
-        }
-        for valueIndex = 1, 5 do
-            local value = values[valueIndex]
-            local text = tostring(value or "")
+        local sourceType = type(source)
+        if sourceType == "string" or sourceType == "number" then
+            local text = tostring(source)
             local decimal = text:match("^(-?%d+)$")
             if decimal ~= nil then
                 local numeric = tonumber(decimal)
@@ -1352,9 +1430,7 @@ local function resolveCatalogId(folder, metadata, generation)
     if folder == nil or metadata == nil or state.resolutionPending then return end
     local settingsOk, configured = pcall(configureApiFromReflectedGameSettings)
     if not settingsOk then configured = false end
-    if not configured then
-        configureApiFromGameSettings()
-    end
+    if not configured then configureApiFromGameSettings() end
     state.resolutionPending = true
     local function finish(id, message)
         if generation ~= state.resolutionGeneration then return end
@@ -1410,7 +1486,7 @@ local function resolvePlayedSongState(manager)
     -- Capture the live hash before consulting the installed catalog. On the
     -- first Results poll state.beatmap is usually still empty; resolving the
     -- catalog before filling it leaves the one-shot capture marked complete
-    -- and prevents the fixture's .id marker from ever being used.
+    -- and prevents the installed marker from ever being used.
     if beatMap ~= nil and state.beatmap == nil then
         local beatMapHash = safeCall(function() return beatMap:GetHash() end, nil)
         state.beatmap = extractHash(beatMapHash)
@@ -1578,6 +1654,19 @@ local function poll()
         log("info", "Results UI polling started")
     end
     local panel, panelName, mode = findActiveResultsPanel()
+    resolveDeferredButtonPaths()
+    if state.voteLoadPending and state.widgets ~= nil then
+        state.voteLoadPending = false
+        loadVote()
+    end
+    if state.voteDetailsPending and type(state.voteDetailsRequest) == "function"
+        and state.widgets ~= nil then
+        log("info", "vote details pending worker poll; starting request")
+        local request = state.voteDetailsRequest
+        state.voteDetailsRequest = nil
+        state.voteDetailsPending = false
+        request()
+    end
     local manager, managerName = nil, nil
     if panel ~= nil then
         manager, managerName = findPlayedSongManager()
@@ -1622,11 +1711,10 @@ local function poll()
         state.lastLoggedCustomScoresAllowed = state.customScoresAllowed
         log("info", "custom score sending allowed=" .. tostring(state.customScoresAllowed))
     end
-    if panel == nil or state.custom ~= true or state.beatmap == nil
+    if panel == nil or state.custom ~= true
         or state.songId == nil or state.customScoresAllowed ~= true then
         local reason = panel == nil and "no_results_panel"
             or state.custom ~= true and "song_not_custom"
-            or state.beatmap == nil and "beatmap_unresolved"
             or state.songId == nil and "song_id_unresolved"
             or "custom_score_sending_disabled"
         if reason ~= state.lastSuppressionReason then
@@ -1671,6 +1759,10 @@ local function poll()
         else
             createOnGameThread()
         end
+        if state.voteLoadPending and state.widgets ~= nil then
+            state.voteLoadPending = false
+            loadVote()
+        end
         return
     end
     -- Re-apply the base/hover variant on the game thread so Slate focus
@@ -1680,21 +1772,32 @@ end
 
 installHooks()
 local function protectedPoll()
-    local ok, err = pcall(poll)
+    local ok, err = pcall(function()
+        poll()
+    end)
     if not ok and not state.diagnostics.pollError then
         state.diagnostics.pollError = true
         log("error", "Results UI poll failed: " .. tostring(err))
     end
 end
-if type(LoopAsync) == "function" then
-    LoopAsync(500, protectedPoll)
-elseif type(ExecuteWithDelay) == "function" then
-    local function delayedPoll()
-        protectedPoll()
-        ExecuteWithDelay(100, delayedPoll)
+local function schedulePoll()
+    if type(ExecuteWithDelay) == "function" then
+        ExecuteWithDelay(500, function()
+            protectedPoll()
+            schedulePoll()
+        end)
+        return true
     end
-    ExecuteWithDelay(100, delayedPoll)
-else
+    if type(LoopAsync) == "function" then
+        LoopAsync(500, function()
+            protectedPoll()
+            schedulePoll()
+        end)
+        return true
+    end
+    return false
+end
+if not schedulePoll() then
     log("error", "UE4SS scheduler unavailable")
 end
 
