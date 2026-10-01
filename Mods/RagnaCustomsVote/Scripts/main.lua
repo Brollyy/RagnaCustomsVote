@@ -560,9 +560,10 @@ local function makeButton(canvas, context, mode, label, geometry)
         if mode == "flat" then
             root:SetRenderScale({ X = 0.36, Y = 0.6 })
         else
-            -- Preserve the proven VR hit geometry. The slot is widened below
-            -- so the scaled content fits instead of clipping large counts.
-            root:SetRenderScale({ X = 1.32, Y = 1.58 })
+            -- The native VR scoreboard surface is 840x195. Keep the
+            -- authored button content inside its slot; scaling it beyond the
+            -- slot makes the icon/count disappear at the right edge.
+            root:SetRenderScale({ X = 0.68, Y = 0.92 })
         end
         root:SetRenderOpacity(1.0)
         root:SetRenderTransformTranslation({ X = 0.0, Y = 0.0 })
