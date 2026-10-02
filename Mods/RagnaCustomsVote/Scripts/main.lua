@@ -563,7 +563,9 @@ local function makeButton(canvas, context, mode, label, geometry)
             -- The native VR scoreboard surface is 840x195. Keep the
             -- authored button content inside its slot; scaling it beyond the
             -- slot makes the icon/count disappear at the right edge.
-            root:SetRenderScale({ X = 1.0, Y = 1.0 })
+            -- Leave horizontal room for the full numeric count, including
+            -- four-digit values, without clipping the authored button.
+            root:SetRenderScale({ X = 0.82, Y = 1.0 })
         end
         root:SetRenderOpacity(1.0)
         root:SetRenderTransformTranslation({ X = 0.0, Y = 0.0 })
@@ -697,9 +699,6 @@ local function renderNow()
         local separator = state.mode == "vr" and "" or " "
         local function displayCount(value)
             value = tonumber(value) or 0
-            if state.mode == "vr" and value >= 1000 then
-                return tostring(math.floor((value + 500) / 1000)) .. "k"
-            end
             return tostring(value)
         end
         setText(widgets.up.text, "▲" .. separator .. displayCount(state.upvotes))
@@ -987,8 +986,8 @@ local function createVrWidgets(panelPath)
         return false
     end
     local buttons = createVoteButtons(targetCanvas, context, "vr", {
-        { direction = "up", label = "▲ 0", geometry = { x = 1195, y = 453, width = 400, height = 78, z = 9000 } },
-        { direction = "down", label = "▼ 0", geometry = { x = 1195, y = 542, width = 400, height = 78, z = 9001 } },
+        { direction = "up", label = "▲ 0", geometry = { x = 1050, y = 453, width = 400, height = 78, z = 9000 } },
+        { direction = "down", label = "▼ 0", geometry = { x = 1050, y = 542, width = 400, height = 78, z = 9001 } },
     })
     if buttons == nil then
         log("error", "failed to attach VR vote buttons to ScoreboardWidget")
