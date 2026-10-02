@@ -29,7 +29,7 @@ def main() -> int:
         assert manifest["version"] == VERSION
         assert manifest["game"] == "ragnarock"
         assert manifest["requires"] == {"manager": ">=0.2.0"}
-        assert manifest["dependencies"] == {"ragnacustoms-api": ">=0.2.0"}
+        assert manifest["dependencies"] == {"ragnacustoms-api": ">=0.3.0"}
         assert manifest["files"] == [
             {"type": "ue4ss-lua", "source": "Scripts/", "modFolder": "RagnaCustomsVote"}
         ]

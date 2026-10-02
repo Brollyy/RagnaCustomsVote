@@ -2,7 +2,7 @@
 
 UE4SS Lua mod for Ragnarock that adds custom-song voting controls to the Flat and PC-VR Results screens.
 
-It is distributed as an `.rmod` package and requires the separately published [`RagnaCustomsApi`](https://github.com/Brollyy/RagnaCustomsApi) library mod. The vote mod explicitly opts into the canonical WanApi contract; the game must provide its `CustomApiUrls` configuration.
+Requires [`RagnaCustomsApi`](https://github.com/Brollyy/RagnaCustomsApi) 0.3.0 or newer.
 
 ## Build and verify
 
