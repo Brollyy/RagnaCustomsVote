@@ -565,7 +565,7 @@ local function makeButton(canvas, context, mode, label, geometry)
             -- slot makes the icon/count disappear at the right edge.
             -- Leave horizontal room for the full numeric count, including
             -- four-digit values, without clipping the authored button.
-            root:SetRenderScale({ X = 0.9, Y = 1.0 })
+            root:SetRenderScale({ X = 0.96, Y = 1.0 })
         end
         root:SetRenderOpacity(1.0)
         root:SetRenderTransformTranslation({ X = 0.0, Y = 0.0 })
