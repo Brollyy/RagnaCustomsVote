@@ -563,7 +563,7 @@ local function makeButton(canvas, context, mode, label, geometry)
             -- The native VR scoreboard surface is 840x195. Keep the
             -- authored button content inside its slot; scaling it beyond the
             -- slot makes the icon/count disappear at the right edge.
-            root:SetRenderScale({ X = 0.68, Y = 0.92 })
+            root:SetRenderScale({ X = 1.0, Y = 1.0 })
         end
         root:SetRenderOpacity(1.0)
         root:SetRenderTransformTranslation({ X = 0.0, Y = 0.0 })
