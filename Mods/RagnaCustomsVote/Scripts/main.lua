@@ -99,7 +99,6 @@ local state = _G.__ragnaCustomsVoteState or {
     renderQueued = false,
     recoveryAttempts = 0,
     recoveryQueued = false,
-    pendingVote = nil,
     voteDetailsPending = false,
     voteDetailsRequest = nil,
     voteLoadPending = false,
@@ -108,7 +107,6 @@ _G.__ragnaCustomsVoteState = state
 state.diagnostics = state.diagnostics or {}
 state.recoveryAttempts = state.recoveryAttempts or 0
 state.recoveryQueued = state.recoveryQueued or false
-state.pendingVote = state.pendingVote or nil
 state.voteDetailsPending = state.voteDetailsPending or false
 state.voteDetailsRequest = state.voteDetailsRequest or nil
 state.voteLoadPending = state.voteLoadPending or false
@@ -551,7 +549,6 @@ local function makeButton(canvas, context, mode, label, geometry)
     -- being constructed; reading or mutating it can stall/crash the game.
     -- The wrapper is the owned input surface and is sufficient for layout,
     -- tinting, and the class-level press hook.
-    local innerButton = nil
     safeCall(function()
         root:SetRenderTransformPivot({ X = 0.0, Y = 0.0 })
         -- FlatInGameButton's authored content is approximately 300x70. VR
@@ -583,13 +580,11 @@ local function makeButton(canvas, context, mode, label, geometry)
         return "pos=" .. tostring(position and position.X) .. "," .. tostring(position and position.Y)
             .. " size=" .. tostring(size and size.X) .. "," .. tostring(size and size.Y)
     end
-    log("info", "vote button layout root=" .. slotDescription(root)
-        .. " inner=" .. slotDescription(innerButton))
+    log("info", "vote button layout root=" .. slotDescription(root))
     return {
         root = root,
         label = label,
         button = root,
-        innerButton = innerButton,
         text = child,
         objectPath = objectPath(root),
     }
@@ -649,7 +644,6 @@ local function removeWidgets()
     state.loadedSongId = nil
     state.phase = "hidden"
     state.pressed = { up = false, down = false }
-    state.pendingVote = nil
 end
 
 local function renderNow()
@@ -658,7 +652,7 @@ local function renderNow()
         return
     end
     local function isHighlighted(entry)
-        local target = valid(entry.innerButton) and entry.innerButton or entry.button
+        local target = entry.button
         return safeCall(function() return target:IsHovered() end, false)
             or safeCall(function() return target:HasKeyboardFocus() end, false)
     end
@@ -696,13 +690,12 @@ local function renderNow()
         status = "Vote unavailable"
     end
     if state.phase ~= "loading" and state.phase ~= "submitting" then
-        local separator = state.mode == "vr" and "" or " "
         local function displayCount(value)
             value = tonumber(value) or 0
             return tostring(value)
         end
-        setText(widgets.up.text, "▲" .. separator .. displayCount(state.upvotes))
-        setText(widgets.down.text, "▼" .. separator .. displayCount(state.downvotes))
+        setText(widgets.up.text, "▲ " .. displayCount(state.upvotes))
+        setText(widgets.down.text, "▼ " .. displayCount(state.downvotes))
     end
     if widgets.status ~= nil then setText(widgets.status.text, status) end
 end
@@ -723,7 +716,7 @@ end
 
 local loadVote
 
-local function applyResponse(result, responseKind)
+local function applyResponse(result)
     if state.widgets == nil then
         return
     end
@@ -760,19 +753,7 @@ local function applyResponse(result, responseKind)
     state.recoveryQueued = false
     state.phase = "ready"
     state.error = nil
-    local currentVote = result.state.currentVote
-    local pendingVote = state.pendingVote
-    if responseKind == "mutation" and currentVote == nil and pendingVote ~= nil then
-        -- Some production mutation responses contain counts but omit
-        -- votes.mine. Preserve the action locally; a second click on the
-        -- same direction still resolves to nil as a normal toggle-off.
-        currentVote = pendingVote.previous == pendingVote.direction
-            and nil or pendingVote.direction
-        log("info", "vote response omitted mine; inferred current=" .. tostring(currentVote)
-            .. " from direction=" .. tostring(pendingVote.direction))
-    end
-    state.pendingVote = nil
-    state.currentVote = currentVote
+    state.currentVote = result.state.currentVote
     state.upvotes = result.state.upvotes
     state.downvotes = result.state.downvotes
     log("info", "vote response applied current=" .. tostring(state.currentVote)
@@ -827,19 +808,19 @@ local function installApiEventHandlers()
     state.apiEventsInstalled = true
     Api.on("vote.details.completed", function(payload)
         if payload == nil or tostring(payload.id) ~= tostring(state.songId) then return end
-        applyResponse(apiVoteResult(payload.response, nil), "details")
+        applyResponse(apiVoteResult(payload.response, nil))
     end)
     Api.on("vote.details.failed", function(payload)
         if payload == nil or tostring(payload.id) ~= tostring(state.songId) then return end
-        applyResponse(apiVoteResult(nil, payload.error), "details")
+        applyResponse(apiVoteResult(nil, payload.error))
     end)
     Api.on("vote.completed", function(payload)
         if payload == nil or tostring(payload.id) ~= tostring(state.songId) then return end
-        applyResponse(apiVoteResult(payload.response, nil), "mutation")
+        applyResponse(apiVoteResult(payload.response, nil))
     end)
     Api.on("vote.failed", function(payload)
         if payload == nil or tostring(payload.id) ~= tostring(state.songId) then return end
-        applyResponse(apiVoteResult(nil, payload.error), "mutation")
+        applyResponse(apiVoteResult(nil, payload.error))
     end)
 end
 
@@ -870,10 +851,6 @@ local function submit(direction)
     local desired = direction
     log("info", "vote submit current=" .. tostring(state.currentVote)
         .. " requested=" .. tostring(direction) .. " desired=" .. tostring(desired))
-    state.pendingVote = {
-        direction = direction,
-        previous = state.currentVote,
-    }
     state.phase = "submitting"
     render()
     installApiEventHandlers()
