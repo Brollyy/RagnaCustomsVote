@@ -866,10 +866,9 @@ local function submit(direction)
 end
 
 local BUTTON_HANDLER_PATHS = {
-    -- The generated Blueprint delegate handlers are retained for builds where
-    -- UE4SS dispatches them, while the native UButton callback is the input
-    -- path used by the current Flat build.
-    native = "/Script/UMG.Button:SlateHandleClicked",
+    -- UE4SS 3.0.1 rejects the native SlateHandleClicked hook on this build.
+    -- The generated Blueprint handler is registered for only the active UI
+    -- flow and receives the wrapped button instance for direction filtering.
     flat = "/Game/Flat/Blueprints/UI/InGame/FlatInGameButton.FlatInGameButton_C:"
         .. "BndEvt__FlatInGameButton_Button_64_K2Node_ComponentBoundEvent_0_OnButtonPressedEvent__DelegateSignature",
     vr = "/Game/VRKeyboards/Blueprints/Keyboards/BasicPointAndClick/WBP_Button_Basic.WBP_Button_Basic_C:"
@@ -934,19 +933,13 @@ local function installButtonHooks()
             submit(direction)
         end
     end
-    for _, handlerPath in pairs(BUTTON_HANDLER_PATHS) do
-        local ok, hookError
-        if handlerPath == BUTTON_HANDLER_PATHS.native then
-            ok, hookError = pcall(RegisterHook, handlerPath, function() end, onButtonPressed)
-        else
-            ok, hookError = pcall(RegisterHook, handlerPath, onButtonPressed)
-        end
+    local handlerPath = BUTTON_HANDLER_PATHS[state.mode]
+    if handlerPath ~= nil then
+        local ok, hookError = pcall(RegisterHook, handlerPath, onButtonPressed)
         log("info", "Results button hook registration path=" .. handlerPath
             .. " ok=" .. tostring(ok)
             .. (hookError ~= nil and " error=" .. tostring(hookError) or ""))
-        if ok then
-            installed = true
-        end
+        installed = ok
     end
     state.buttonHooksInstalled = installed
     if installed then
