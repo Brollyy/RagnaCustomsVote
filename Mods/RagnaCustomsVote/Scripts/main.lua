@@ -937,7 +937,7 @@ local function installButtonHooks()
     for _, handlerPath in pairs(BUTTON_HANDLER_PATHS) do
         local ok, hookError
         if handlerPath == BUTTON_HANDLER_PATHS.native then
-            ok, hookError = pcall(RegisterHook, handlerPath, nil, onButtonPressed)
+            ok, hookError = pcall(RegisterHook, handlerPath, function() end, onButtonPressed)
         else
             ok, hookError = pcall(RegisterHook, handlerPath, onButtonPressed)
         end
