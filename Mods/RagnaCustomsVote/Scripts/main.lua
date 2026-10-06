@@ -86,6 +86,7 @@ local state = _G.__ragnaCustomsVoteState or {
     panelPath = nil,
     mode = nil,
     widgets = nil,
+    resultsPanel = nil,
     phase = "hidden",
     currentVote = nil,
     upvotes = 0,
@@ -110,6 +111,57 @@ state.recoveryQueued = state.recoveryQueued or false
 state.voteDetailsPending = state.voteDetailsPending or false
 state.voteDetailsRequest = state.voteDetailsRequest or nil
 state.voteLoadPending = state.voteLoadPending or false
+state.reflectionStringRoots = state.reflectionStringRoots or {}
+state.delayedCallbacks = state.delayedCallbacks or {}
+state.delayedCallbackSerial = state.delayedCallbackSerial or 0
+state.gameThreadCallbacks = state.gameThreadCallbacks or {}
+state.gameThreadCallbackSerial = state.gameThreadCallbackSerial or 0
+
+-- UE4SS 3.0.1 keeps non-owning views of Lua strings used for reflected
+-- lookups. Keep any computed member/function names rooted for the lifetime of
+-- the mod so a later Lua GC cannot invalidate those views.
+local function rootReflectionString(value)
+    if type(value) ~= "string" then return value end
+    local roots = state.reflectionStringRoots
+    if roots[value] == nil then roots[value] = value end
+    return roots[value]
+end
+
+local function scheduleWithDelay(delayMs, callback, label)
+    if type(ExecuteWithDelay) ~= "function" then
+        return false, "UE4SS delayed execution is unavailable"
+    end
+    state.delayedCallbackSerial = state.delayedCallbackSerial + 1
+    local callbackId = state.delayedCallbackSerial
+    local rootedCallback = function(...)
+        state.delayedCallbacks[callbackId] = nil
+        if label ~= nil then
+            log("info", "delayed callback fired label=" .. tostring(label))
+        end
+        callback(...)
+    end
+    state.delayedCallbacks[callbackId] = rootedCallback
+    local ok, err = pcall(ExecuteWithDelay, delayMs, rootedCallback)
+    if not ok then state.delayedCallbacks[callbackId] = nil end
+    return ok, err
+end
+
+local function executeOnGameThread(callback)
+    if type(ExecuteInGameThread) ~= "function" then
+        callback()
+        return true
+    end
+    state.gameThreadCallbackSerial = state.gameThreadCallbackSerial + 1
+    local callbackId = state.gameThreadCallbackSerial
+    local rootedCallback = function(...)
+        state.gameThreadCallbacks[callbackId] = nil
+        callback(...)
+    end
+    state.gameThreadCallbacks[callbackId] = rootedCallback
+    local ok, err = pcall(ExecuteInGameThread, rootedCallback)
+    if not ok then state.gameThreadCallbacks[callbackId] = nil end
+    return ok, err
+end
 
 local function safeCall(callback, fallback)
     local ok, result = pcall(callback)
@@ -143,6 +195,12 @@ local function valid(object)
 end
 
 local function fullName(object)
+    if object == nil then return "nil" end
+    local valueType = type(object)
+    if valueType == "string" or valueType == "number" or valueType == "boolean" then
+        return tostring(object)
+    end
+    if not valid(object) then return "<invalid UObject>" end
     return safeCall(function()
         return object:GetFullName()
     end, tostring(object))
@@ -194,12 +252,13 @@ local function findResultsPanelForFlow(flow)
             return { FindFirstOf(className) }
         end, {})
         for _, object in ipairs(objects or {}) do
-            local objectName = fullName(object)
-            if valid(object)
-                and objectName:find("/Engine/Transient.", 1, true) ~= nil
-                and objectName:find("Default__", 1, true) == nil
-                and visible(object) then
-                return object, objectName
+            if valid(object) then
+                local objectName = fullName(object)
+                if objectName:find("/Engine/Transient.", 1, true) ~= nil
+                    and objectName:find("Default__", 1, true) == nil
+                    and visible(object) then
+                    return object, objectName
+                end
             end
         end
     end
@@ -236,6 +295,20 @@ local function findActiveResultsPanel()
     if type(FindFirstOf) ~= "function" then
         return nil
     end
+    if state.widgets ~= nil and valid(state.resultsPanel) then
+        if visible(state.resultsPanel) then
+            return state.resultsPanel, fullName(state.resultsPanel), state.mode
+        end
+        return nil
+    end
+    -- Once the active Results flow is known, query only that flow. In Flat
+    -- mode, repeating FindAllOf("WidgetComponent") scans every tick creates
+    -- needless UE4SS reflection churn while the Results widgets are attached.
+    if state.mode == "flat" then
+        return findFlatResultsPanel()
+    elseif state.mode == "vr" then
+        return findVrResultsPanel()
+    end
     local panel, name, mode = findVrResultsPanel()
     if panel ~= nil then
         return panel, name, mode
@@ -262,18 +335,19 @@ local function findFlatInfoCanvas(panelPath)
             return { FindFirstOf(className) }
         end, {})
         for _, infoWidget in ipairs(widgets or {}) do
-            local name = fullName(infoWidget)
             if valid(infoWidget)
-                and visible(infoWidget)
-                and name:find(tostring(panelPath or ""), 1, true) ~= nil then
-                local tree = safeCall(function() return infoWidget.WidgetTree end, nil)
-                local root = tree and safeCall(function() return tree.RootWidget end, nil) or nil
-                if valid(root) then
-                    if not state.diagnostics.songInfoCanvas then
-                        state.diagnostics.songInfoCanvas = true
-                        log("info", "song info canvas " .. fullName(root))
+                and visible(infoWidget) then
+                local name = fullName(infoWidget)
+                if name:find(tostring(panelPath or ""), 1, true) ~= nil then
+                    local tree = safeCall(function() return infoWidget.WidgetTree end, nil)
+                    local root = tree and safeCall(function() return tree.RootWidget end, nil) or nil
+                    if valid(root) then
+                        if not state.diagnostics.songInfoCanvas then
+                            state.diagnostics.songInfoCanvas = true
+                            log("info", "song info canvas " .. fullName(root))
+                        end
+                        return root, infoWidget
                     end
-                    return root, infoWidget
                 end
             end
         end
@@ -281,12 +355,12 @@ local function findFlatInfoCanvas(panelPath)
     if type(FindAllOf) == "function" then
         local candidates = safeCall(function() return FindAllOf("CanvasPanel") end, {})
         for _, candidate in ipairs(candidates or {}) do
-            local name = fullName(candidate)
-            if valid(candidate)
-                and name:find(tostring(panelPath or ""), 1, true) ~= nil
-                and name:find("FlatItem_SongInfoEnd.WidgetTree.CanvasPanel_0", 1, true) ~= nil
-                and name:find("FlatLeaderboard_C_", 1, true) == nil then
-                if visible(candidate) then
+            if valid(candidate) then
+                local name = fullName(candidate)
+                if name:find(tostring(panelPath or ""), 1, true) ~= nil
+                    and name:find("FlatItem_SongInfoEnd.WidgetTree.CanvasPanel_0", 1, true) ~= nil
+                    and name:find("FlatLeaderboard_C_", 1, true) == nil
+                    and visible(candidate) then
                     if not state.diagnostics.songInfoCanvas then
                         state.diagnostics.songInfoCanvas = true
                         log("info", "song info canvas " .. name)
@@ -304,9 +378,10 @@ local function findVrStatsComponent()
     local best = nil
     local bestScale = -1.0
     for _, component in ipairs(safeCall(function() return FindAllOf("WidgetComponent") end, {}) or {}) do
-        local name = fullName(component)
-        if valid(component) and name:find(".StatsWidget", 1, true) ~= nil
-            and safeCall(function() return component:IsVisible() end, false) then
+        if valid(component) then
+            local name = fullName(component)
+            if name:find(".StatsWidget", 1, true) ~= nil
+                and safeCall(function() return component:IsVisible() end, false) then
             local user = safeCall(function() return component:GetUserWidgetObject() end, nil)
             local scale = safeCall(function() return component:K2_GetComponentScale() end, nil)
             local value = tonumber(scale and scale.X) or 0.0
@@ -319,6 +394,7 @@ local function findVrStatsComponent()
                 best = component
                 bestScale = value
                 if isRenderedPopup then break end
+            end
             end
         end
     end
@@ -336,10 +412,10 @@ end
 local function findVrScoreboardSurface()
     if type(FindAllOf) ~= "function" then return nil, nil, nil end
     for _, component in ipairs(safeCall(function() return FindAllOf("WidgetComponent") end, {}) or {}) do
-        local name = fullName(component)
-        if valid(component)
-            and name:find(".ScoreboardWidget", 1, true) ~= nil
-            and safeCall(function() return component:IsVisible() end, false) then
+        if valid(component) then
+            local name = fullName(component)
+            if name:find(".ScoreboardWidget", 1, true) ~= nil
+                and safeCall(function() return component:IsVisible() end, false) then
             local user = safeCall(function() return component:GetUserWidgetObject() end, nil)
             local tree = valid(user) and safeCall(function() return user.WidgetTree end, nil) or nil
             local root = valid(tree) and safeCall(function() return tree.RootWidget end, nil) or nil
@@ -363,6 +439,7 @@ local function findVrScoreboardSurface()
                 log("info", "VR Scoreboard surface selected component=" .. name
                     .. " root=" .. fullName(root))
                 return component, user, root
+            end
             end
         end
     end
@@ -535,20 +612,13 @@ local function makeButton(canvas, context, mode, label, geometry)
         else
             log("info", "stock Results button labeled before attach label=" .. tostring(label))
         end
-        safeCall(function()
-            child:SetJustification(1) -- ETextJustify::Center
-            child:SetHorizontalAlignment(2) -- EHorizontalAlignment::HAlign_Center
-            child:SetVerticalAlignment(2) -- EVerticalAlignment::VAlign_Center
-            child:SetVisibility(0)
-            child:SetRenderOpacity(1.0)
-            child:SetIsEnabled(true)
-        end, nil)
     end
     -- Do not reflect into the generated nested Button_64. On this build that
     -- property can be a stale native reference while the Blueprint wrapper is
     -- being constructed; reading or mutating it can stall/crash the game.
     -- The wrapper is the owned input surface and is sufficient for layout,
     -- tinting, and the class-level press hook.
+    log("info", "vote button wrapper layout begin label=" .. tostring(label))
     safeCall(function()
         root:SetRenderTransformPivot({ X = 0.0, Y = 0.0 })
         -- FlatInGameButton's authored content is approximately 300x70. VR
@@ -567,6 +637,7 @@ local function makeButton(canvas, context, mode, label, geometry)
         root:SetRenderOpacity(1.0)
         root:SetRenderTransformTranslation({ X = 0.0, Y = 0.0 })
     end, nil)
+    log("info", "vote button wrapper layout done label=" .. tostring(label))
     local attached = addToCanvas(canvas, root, geometry)
     if not attached then
         log("error", "failed to attach Results button widget label=" .. tostring(label))
@@ -640,6 +711,7 @@ local function removeWidgets()
     end
     state.vrOverlayComponent = nil
     state.widgets = nil
+    state.resultsPanel = nil
     state.panelPath = nil
     state.loadedSongId = nil
     state.phase = "hidden"
@@ -707,11 +779,7 @@ local function render()
         state.renderQueued = false
         renderNow()
     end
-    if type(ExecuteInGameThread) == "function" then
-        ExecuteInGameThread(apply)
-    else
-        apply()
-    end
+    executeOnGameThread(apply)
 end
 
 local loadVote
@@ -739,7 +807,7 @@ local function applyResponse(result)
                 loadVote()
             end
             if type(ExecuteWithDelay) == "function" then
-                ExecuteWithDelay(750, retry)
+                scheduleWithDelay(750, retry)
             else
                 retry()
             end
@@ -758,30 +826,14 @@ local function applyResponse(result)
     state.downvotes = result.state.downvotes
     log("info", "vote response applied current=" .. tostring(state.currentVote)
         .. " up=" .. tostring(state.upvotes) .. " down=" .. tostring(state.downvotes))
-    -- Re-enable the input surface immediately when the request completes;
-    -- label repainting is deferred, but click availability must not be.
-    render()
-    -- VaRest callbacks are not guaranteed to run on the game thread. Queue
-    -- all Slate mutations so the attached stock labels can repaint safely.
-    local repaint = function()
-        log("info", "vote repaint entered widgets=" .. tostring(state.widgets ~= nil))
-        if state.widgets == nil then return end
-        log("info", "vote repaint state-only current=" .. tostring(state.currentVote)
-            .. " up=" .. tostring(state.upvotes) .. " down=" .. tostring(state.downvotes))
-        render()
-    end
-    -- Give the freshly-created Blueprint one rendered tick before touching
-    -- its generated TextBlock. Immediate mutation can stall this build.
-    local scheduleOnGameThread = ExecuteWithDelay
-    if type(scheduleOnGameThread) == "function" then
-        ExecuteWithDelay(1000, function()
-            log("info", "vote repaint executing after widget settle")
-            repaint()
-        end)
-    else
-        repaint()
-    end
-    render()
+    -- The API transport dispatches its completion callback to the game thread.
+    -- Apply the Slate changes here instead of nesting ExecuteInGameThread;
+    -- the nested dispatch can remain queued, leaving the newly-created buttons
+    -- disabled for the rest of the Results screen.
+    log("info", "vote response repaint begin widgets=" .. tostring(state.widgets ~= nil))
+    state.renderQueued = false
+    renderNow()
+    log("info", "vote response repaint done")
 end
 
 local function apiVoteResult(responseState, error)
@@ -827,21 +879,20 @@ end
 loadVote = function()
     state.recoveryQueued = false
     state.phase = "loading"
-    render()
+    -- The initial widgets are already disabled. Avoid queuing an extra Slate
+    -- mutation from the create callback; the next response repaints them.
     installApiEventHandlers()
+    local songId = state.songId
     local function startRequest()
-        log("info", "vote details request starting")
-        local _, err = Api.getSongVote(state.songId)
+        log("info", "vote details request starting id=" .. tostring(songId))
+        local _, err = Api.getSongVote(songId)
         if err ~= nil then
             applyResponse(apiVoteResult(nil, { code = "start_failed", message = err }))
         end
     end
-    state.voteDetailsRequest = nil
-    state.voteDetailsPending = false
-    log("info", "vote details request scheduled timer=" .. tostring(type(ExecuteInGameThreadWithDelay))
-        .. " legacy=" .. tostring(type(ExecuteWithDelay))
-        .. " gameThread=" .. tostring(type(ExecuteInGameThread)))
-    startRequest()
+    state.voteDetailsRequest = startRequest
+    state.voteDetailsPending = true
+    log("info", "vote details request queued for next Results poll id=" .. tostring(songId))
 end
 
 local function submit(direction)
@@ -866,10 +917,9 @@ local function submit(direction)
 end
 
 local BUTTON_HANDLER_PATHS = {
-    -- The generated Blueprint delegate handlers are retained for builds where
-    -- UE4SS dispatches them, while the native UButton callback is the input
-    -- path used by the current Flat build.
-    native = "/Script/UMG.Button:SlateHandleClicked",
+    -- UE4SS 3.0.1 rejects the native SlateHandleClicked hook on this build.
+    -- The generated Blueprint handler is registered for only the active UI
+    -- flow and receives the wrapped button instance for direction filtering.
     flat = "/Game/Flat/Blueprints/UI/InGame/FlatInGameButton.FlatInGameButton_C:"
         .. "BndEvt__FlatInGameButton_Button_64_K2Node_ComponentBoundEvent_0_OnButtonPressedEvent__DelegateSignature",
     vr = "/Game/VRKeyboards/Blueprints/Keyboards/BasicPointAndClick/WBP_Button_Basic.WBP_Button_Basic_C:"
@@ -897,25 +947,6 @@ local function voteDirectionForClickedButton(...)
     return nil
 end
 
-local function resolveDeferredButtonPaths()
-    local widgets = state.widgets
-    if widgets == nil then return end
-    for _, entry in pairs(widgets) do
-        if type(entry) == "table" and entry.innerObjectPath == nil and valid(entry.root) then
-            local nested = safeCall(function()
-                return entry.root:GetPropertyValue("Button_64")
-            end, nil)
-            if nested ~= nil then
-                local path = safeCall(function() return objectPath(nested) end, nil)
-                if path ~= nil then
-                    entry.innerObjectPath = path
-                    log("info", "deferred vote button target path=" .. tostring(path))
-                end
-            end
-        end
-    end
-end
-
 local function installButtonHooks()
     if state.buttonHooksInstalled or type(RegisterHook) ~= "function" then
         return
@@ -934,21 +965,18 @@ local function installButtonHooks()
             submit(direction)
         end
     end
-    for _, handlerPath in pairs(BUTTON_HANDLER_PATHS) do
-        local ok, hookError
-        if handlerPath == BUTTON_HANDLER_PATHS.native then
-            ok, hookError = pcall(RegisterHook, handlerPath, nil, onButtonPressed)
-        else
-            ok, hookError = pcall(RegisterHook, handlerPath, onButtonPressed)
-        end
+    state.buttonHookCallback = onButtonPressed
+    local handlerPath = BUTTON_HANDLER_PATHS[state.mode]
+    if handlerPath ~= nil then
+        handlerPath = rootReflectionString(handlerPath)
+        local ok, hookError = pcall(RegisterHook, handlerPath, onButtonPressed)
         log("info", "Results button hook registration path=" .. handlerPath
             .. " ok=" .. tostring(ok)
             .. (hookError ~= nil and " error=" .. tostring(hookError) or ""))
-        if ok then
-            installed = true
-        end
+        installed = ok
     end
     state.buttonHooksInstalled = installed
+    if not installed then state.buttonHookCallback = nil end
     if installed then
         log("info", "installed exact-instance Results vote button hooks")
     else
@@ -1082,16 +1110,29 @@ local function findPlayedSongManager()
             return { FindFirstOf(className) }
         end, {})
         for _, manager in ipairs(managers or {}) do
-            local managerName = fullName(manager)
-            if valid(manager)
-                and managerName:find("/Engine/Transient.", 1, true) ~= nil
-                and managerName:find("Default__", 1, true) == nil
-                and managerName:find("Latency", 1, true) == nil then
-                return manager, managerName
+            if valid(manager) then
+                local managerName = fullName(manager)
+                if managerName:find("/Engine/Transient.", 1, true) ~= nil
+                    and managerName:find("Default__", 1, true) == nil
+                    and managerName:find("Latency", 1, true) == nil then
+                    return manager, managerName
+                end
             end
         end
     end
     return nil
+end
+
+local function findLiveSongObject(className)
+    if type(FindFirstOf) ~= "function" then return nil end
+    local object = safeCall(function() return FindFirstOf(className) end, nil)
+    if not valid(object) then return nil end
+    local name = fullName(object)
+    if name:find("/Engine/Transient.", 1, true) == nil
+        or name:find("Default__", 1, true) ~= nil then
+        return nil
+    end
+    return object
 end
 
 local function extractSongId(value)
@@ -1127,13 +1168,15 @@ end
 
 local function invokeMember(object, name)
     if object == nil or type(object.CallFunction) ~= "function" then return nil end
+    name = rootReflectionString(name)
     local member = safeCall(function() return object[name] end, nil)
     if member == nil and type(StaticFindObject) == "function" then
         local class = safeCall(function() return object:GetClass() end, nil)
         local className = tostring(fullName(class or "")):gsub("^Class ", "")
         if className ~= "" then
+            local functionPath = rootReflectionString("Function " .. className .. ":" .. name)
             member = safeCall(function()
-                return StaticFindObject("Function " .. className .. ":" .. name)
+                return StaticFindObject(functionPath)
             end, nil)
         end
     end
@@ -1165,8 +1208,9 @@ local function objectValue(object, names)
     for _, name in ipairs(names or {}) do
         local value = safeCall(function()
             if name:sub(1, 1) == "@" then
-                return object:GetPropertyValue(name:sub(2))
+                return object:GetPropertyValue(rootReflectionString(name:sub(2)))
             end
+            name = rootReflectionString(name)
             local member = object[name]
             if type(member) == "function" then return member(object) end
             if member ~= nil and tostring(fullName(member)):match("^Function ") then
@@ -1200,8 +1244,9 @@ local function property(object, names)
     for _, name in ipairs(names or {}) do
         local value = safeCall(function()
             if name:sub(1, 1) == "@" then
-                return object:GetPropertyValue(name:sub(2))
+                return object:GetPropertyValue(rootReflectionString(name:sub(2)))
             end
+            name = rootReflectionString(name)
             local member = object[name]
             if type(member) == "function" then return member(object) end
             if member ~= nil and tostring(fullName(member)):match("^Function ") then
@@ -1262,8 +1307,11 @@ end
 local function listProperty(object, names)
     local value = nil
     for _, name in ipairs(names or {}) do
+        name = rootReflectionString(name)
         value = safeCall(function()
-            if name:sub(1, 1) == "@" then return object:GetPropertyValue(name:sub(2)) end
+            if name:sub(1, 1) == "@" then
+                return object:GetPropertyValue(rootReflectionString(name:sub(2)))
+            end
             local member = object[name]
             if member ~= nil and tostring(fullName(member)):match("^Function ") then
                 return invokeMember(object, name)
@@ -1344,6 +1392,7 @@ end
 local function probeLiveProperties(object, label, names)
     if object == nil then return end
     for _, name in ipairs(names or {}) do
+        name = rootReflectionString(name)
         local value = safeCall(function() return object:GetPropertyValue(name) end, nil)
         local direct = safeCall(function() return object[name] end, nil)
         if value ~= nil then
@@ -1367,7 +1416,8 @@ local function probeLiveProperties(object, label, names)
                     if count <= 160 then
                         local propName = safeCall(function() return prop:GetFullName() end, nil)
                             or safeCall(function() return prop:GetName() end, nil)
-                        local shortName = tostring(propName or ""):match("([^%.:]+)$") or tostring(propName or "")
+                        local shortName = rootReflectionString(
+                            tostring(propName or ""):match("([^%.:]+)$") or tostring(propName or ""))
                         local raw = safeCall(function() return object:GetPropertyValue(shortName) end, nil)
                         local directValue = safeCall(function() return object[shortName] end, nil)
                         log("info", "live reflected property object=" .. label
@@ -1444,7 +1494,7 @@ local function resolveCatalogId(folder, metadata, generation)
 end
 
 local function resolvePlayedSongState(manager)
-    if not valid(manager) and not valid(state.liveBeatMap) then
+    if not valid(manager) and not valid(state.liveSong) and not valid(state.liveBeatMap) then
         return false
     end
     local song = valid(manager) and safeCall(function()
@@ -1547,79 +1597,6 @@ extractBoolean = function(...)
     return nil
 end
 
-local function installHook(name, pre, post)
-    if type(RegisterHook) ~= "function" then
-        return false
-    end
-    local ok
-    if post ~= nil then
-        ok = pcall(RegisterHook, name, pre, post)
-    else
-        ok = pcall(RegisterHook, name, pre)
-    end
-    return ok
-end
-
-local function installHooks()
-    if state.hooksInstalled then
-        return
-    end
-    state.hooksInstalled = true
-    local hashPost = function(...)
-        local hash = extractHash(...)
-        for index = 1, select("#", ...) do
-            local candidate = unwrap(select(index, ...))
-            if valid(candidate) and type(candidate) ~= "function" then
-                local name = fullName(candidate)
-                if name:find("BeatMap", 1, true) ~= nil then
-                    state.liveBeatMap = candidate
-                elseif name:find("Song", 1, true) ~= nil then
-                    state.liveSong = candidate
-                end
-            end
-        end
-        if hash ~= nil then
-            state.beatmap = hash
-        end
-    end
-    local customPost = function(...)
-        local custom = extractBoolean(...)
-        if custom ~= nil then
-            state.custom = custom
-        end
-    end
-    local owners = { "SongsManager" }
-    for _, owner in ipairs(owners) do
-        installHook("/Script/Ragnarock." .. owner .. ":GetBeatMapHashFromCompositeId", function() end, hashPost)
-        installHook("/Script/Ragnarock." .. owner .. ":IsCustomSong", function() end, customPost)
-    end
-    installHook("/Script/Ragnarock.BeatMap:GetHash", function() end, hashPost)
-    local function captureSongStringHook(label)
-        return function(self, ...)
-            for index = 1, select("#", ...) do
-                local value = select(index, ...)
-                local valueType = tostring(safeCall(function() return value:type() end, ""))
-                local text = safeCall(function()
-                    if valueType == "RemoteUnrealParam" then value = value:get() end
-                    if value ~= nil and tostring(safeCall(function() return value:type() end, "")) == "FString" then
-                        return value:ToString()
-                    end
-                    return type(value) == "string" and value or nil
-                end, nil)
-                if text ~= nil and text ~= "" then
-                    local normalizedText = text:gsub("\\", "/")
-                    if normalizedText:lower():find("customsongs/", 1, true) then
-                        state.liveSongPath = normalizedText
-                        log("info", "captured live Song." .. label .. " path=" .. normalizedText)
-                    end
-                end
-            end
-        end
-    end
-    installHook("/Script/Ragnarock.Song:SetPath", function() end, captureSongStringHook("SetPath"))
-    installHook("/Script/Ragnarock.Song:Setup", function() end, captureSongStringHook("Setup"))
-end
-
 _G.RagnaCustomsVoteSetBeatmapHash = function(hash, isCustom, songId)
     state.beatmap = hash and extractHash(hash) or nil
     state.custom = isCustom == true
@@ -1631,7 +1608,6 @@ local function poll()
         log("info", "Results UI polling started")
     end
     local panel, panelName, mode = findActiveResultsPanel()
-    resolveDeferredButtonPaths()
     if state.voteLoadPending and state.widgets ~= nil then
         state.voteLoadPending = false
         loadVote()
@@ -1647,9 +1623,15 @@ local function poll()
     local manager, managerName = nil, nil
     if panel ~= nil then
         manager, managerName = findPlayedSongManager()
+        if not valid(manager) then
+            state.liveSong = findLiveSongObject("Song") or state.liveSong
+            state.liveBeatMap = findLiveSongObject("BeatMap") or state.liveBeatMap
+        end
     end
-    local liveObjectPath = managerName or (valid(state.liveBeatMap) and fullName(state.liveBeatMap) or nil)
-    if panel ~= nil and (manager ~= nil or valid(state.liveBeatMap)) and not state.captureQueued
+    local liveObjectPath = managerName
+        or (valid(state.liveSong) and fullName(state.liveSong))
+        or (valid(state.liveBeatMap) and fullName(state.liveBeatMap) or nil)
+    if panel ~= nil and (valid(manager) or valid(state.liveSong) or valid(state.liveBeatMap)) and not state.captureQueued
         and (state.captureManagerPath ~= liveObjectPath or state.captureResolved ~= true) then
         state.captureQueued = true
         local function captureOnGameThread()
@@ -1657,11 +1639,7 @@ local function poll()
             state.captureResolved = resolvePlayedSongState(manager)
             state.captureQueued = false
         end
-        if type(ExecuteInGameThread) == "function" then
-            ExecuteInGameThread(captureOnGameThread)
-        else
-            captureOnGameThread()
-        end
+        executeOnGameThread(captureOnGameThread)
         return
     end
     -- Reflected GameInstance getters are game-thread calls. Probe the single
@@ -1676,11 +1654,7 @@ local function poll()
                 state.customScoresAllowed = customScoreSendingAllowed()
                 state.settingProbeQueued = false
             end
-            if type(ExecuteInGameThread) == "function" then
-                ExecuteInGameThread(probeOnGameThread)
-            else
-                probeOnGameThread()
-            end
+            executeOnGameThread(probeOnGameThread)
         end
         return
     end
@@ -1720,26 +1694,28 @@ local function poll()
         end
         state.createQueued = true
         local function createOnGameThread()
+            local created = false
             if valid(panel) then
                 removeWidgets()
-                local created = createWidgets(panel, path, mode)
+                created = createWidgets(panel, path, mode)
                 if not created then
                     state.createFailedPath = path
                 else
                     state.createFailedPath = nil
+                    state.resultsPanel = panel
                 end
             end
             state.createQueued = false
+            if created and state.voteLoadPending then
+                state.voteLoadPending = false
+                log("info", "dispatching initial vote load after Results widgets are attached")
+                local ok, err = pcall(loadVote)
+                if not ok then
+                    log("error", "initial vote load dispatch failed: " .. tostring(err))
+                end
+            end
         end
-        if type(ExecuteInGameThread) == "function" then
-            ExecuteInGameThread(createOnGameThread)
-        else
-            createOnGameThread()
-        end
-        if state.voteLoadPending and state.widgets ~= nil then
-            state.voteLoadPending = false
-            loadVote()
-        end
+        executeOnGameThread(createOnGameThread)
         return
     end
     -- Re-apply the base/hover variant on the game thread so Slate focus
@@ -1747,7 +1723,6 @@ local function poll()
     render()
 end
 
-installHooks()
 local function protectedPoll()
     local ok, err = pcall(function()
         poll()
@@ -1759,11 +1734,11 @@ local function protectedPoll()
 end
 local function schedulePoll()
     if type(ExecuteWithDelay) == "function" then
-        ExecuteWithDelay(500, function()
+        local scheduled = scheduleWithDelay(500, function()
             protectedPoll()
             schedulePoll()
         end)
-        return true
+        return scheduled
     end
     if type(LoopAsync) == "function" then
         LoopAsync(500, function()
