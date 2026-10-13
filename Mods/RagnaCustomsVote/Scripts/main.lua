@@ -1123,18 +1123,6 @@ local function findPlayedSongManager()
     return nil
 end
 
-local function findLiveSongObject(className)
-    if type(FindFirstOf) ~= "function" then return nil end
-    local object = safeCall(function() return FindFirstOf(className) end, nil)
-    if not valid(object) then return nil end
-    local name = fullName(object)
-    if name:find("/Engine/Transient.", 1, true) == nil
-        or name:find("Default__", 1, true) ~= nil then
-        return nil
-    end
-    return object
-end
-
 local function extractSongId(value)
     value = unwrap(value)
     if value == nil then return nil end
@@ -1493,20 +1481,24 @@ local function resolveCatalogId(folder, metadata, generation)
     log("info", "catalog discovery request returned type=" .. type(discoveryRequest))
 end
 
+-- Keep the played-song identity attached to its manager. Globally enumerated
+-- Song objects include catalog entries that are unrelated to the Results run.
+local function managerSongReferences(manager, isValid, readMember)
+    if not isValid(manager) then return nil, nil, false end
+    return readMember(manager, "GetSong", "m_song"),
+        readMember(manager, "GetBeatMap", "m_beatMap"), true
+end
+
 local function resolvePlayedSongState(manager)
-    if not valid(manager) and not valid(state.liveSong) and not valid(state.liveBeatMap) then
-        return false
+    -- Global Song/BeatMap objects include category and selector catalog entries.
+    -- They are not evidence of what was just played, so only resolve from the
+    -- active BeatManager that owns the completed run.
+    local function readManagerMember(object, getter, field)
+        return safeCall(function() return invokeMember(object, getter) end,
+            safeCall(function() return object[field] end, nil))
     end
-    local song = valid(manager) and safeCall(function()
-        return manager:GetSong()
-    end, safeCall(function()
-        return manager.m_song
-    end, nil)) or state.liveSong or relatedSong(state.liveBeatMap)
-    local beatMap = valid(manager) and safeCall(function()
-        return manager:GetBeatMap()
-    end, safeCall(function()
-        return manager.m_beatMap
-    end, nil)) or state.liveBeatMap
+    local song, beatMap, managerValid = managerSongReferences(manager, valid, readManagerMember)
+    if not managerValid then return false end
     log("info", "live song objects manager=" .. tostring(valid(manager) and fullName(manager) or "nil")
         .. " song=" .. tostring(song ~= nil and fullName(song) or "nil")
         .. " beatMap=" .. tostring(beatMap ~= nil and fullName(beatMap) or "nil"))
@@ -1623,15 +1615,9 @@ local function poll()
     local manager, managerName = nil, nil
     if panel ~= nil then
         manager, managerName = findPlayedSongManager()
-        if not valid(manager) then
-            state.liveSong = findLiveSongObject("Song") or state.liveSong
-            state.liveBeatMap = findLiveSongObject("BeatMap") or state.liveBeatMap
-        end
     end
     local liveObjectPath = managerName
-        or (valid(state.liveSong) and fullName(state.liveSong))
-        or (valid(state.liveBeatMap) and fullName(state.liveBeatMap) or nil)
-    if panel ~= nil and (valid(manager) or valid(state.liveSong) or valid(state.liveBeatMap)) and not state.captureQueued
+    if panel ~= nil and valid(manager) and not state.captureQueued
         and (state.captureManagerPath ~= liveObjectPath or state.captureResolved ~= true) then
         state.captureQueued = true
         local function captureOnGameThread()
@@ -1641,6 +1627,23 @@ local function poll()
         end
         executeOnGameThread(captureOnGameThread)
         return
+    end
+    if panel ~= nil and not valid(manager) then
+        if not state.diagnostics.missingPlayedSongManager then
+            state.diagnostics.missingPlayedSongManager = true
+            log("warn", "cannot resolve Results song: active BeatManager reference is unavailable")
+        end
+        state.songId = nil
+        state.songFolder = nil
+        state.songMetadata = nil
+        state.resolutionKey = nil
+        state.resolutionGeneration = (state.resolutionGeneration or 0) + 1
+        state.resolutionPending = false
+        state.captureManagerPath = nil
+        state.captureResolved = false
+        if state.widgets ~= nil then removeWidgets() end
+    elseif valid(manager) then
+        state.diagnostics.missingPlayedSongManager = nil
     end
     -- Reflected GameInstance getters are game-thread calls. Probe the single
     -- stable setting once rather than invoking reflection on every poll.
