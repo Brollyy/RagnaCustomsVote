@@ -1260,6 +1260,7 @@ local function loadedSongFolder(object, allowRelated)
     }
     local objectPath = object ~= nil and tostring(fullName(object)) or nil
     state.diagnostics.pathFunctionProbes = state.diagnostics.pathFunctionProbes or {}
+    state.diagnostics.pathValues = state.diagnostics.pathValues or {}
     if object ~= nil and not state.diagnostics.pathFunctionProbes[objectPath] then
         state.diagnostics.pathFunctionProbes[objectPath] = true
         local getterNames = { "GetPath" }
@@ -1267,6 +1268,7 @@ local function loadedSongFolder(object, allowRelated)
             local raw = safeCall(function() return invokeMember(object, getterName) end, nil)
             local candidate = textValue(raw)
             if candidate ~= nil and candidate ~= "" then
+                state.diagnostics.pathValues[objectPath] = candidate
                 table.insert(candidates, candidate)
                 log("info", "live song path getter=" .. getterName .. " value=" .. candidate)
             end
@@ -1521,10 +1523,6 @@ local function resolvePlayedSongState(manager)
     end
     log("info", "song resolution probe beatmap=" .. tostring(state.beatmap)
         .. " beatMap=" .. tostring(beatMap))
-    local rawCustom = song and safeCall(function()
-        return song:IsCustom()
-    end, nil) or nil
-    local custom = extractBoolean(rawCustom)
     local folderOk, folder = pcall(function()
         -- The manager already yielded the active Song and BeatMap above.
         -- Query each object's path once per object; don't call GetSong on the
@@ -1537,6 +1535,80 @@ local function resolvePlayedSongState(manager)
         log("warn", "live song folder resolver error=" .. tostring(folder))
         folder = nil
     end
+    local songObjectPath = song ~= nil and tostring(fullName(song)) or nil
+    state.diagnostics.pathValues = state.diagnostics.pathValues or {}
+    local songPath = songObjectPath and state.diagnostics.pathValues[songObjectPath] or nil
+    local normalizedSongPath = type(songPath) == "string"
+        and string.lower(songPath:gsub("\\", "/"):gsub("/+", "/")) or ""
+    local isCustomPath = folder ~= nil or normalizedSongPath:find("customsongs/", 1, true) ~= nil
+    local isOfficialPath = normalizedSongPath:find("/content/songsdata/", 1, true) ~= nil
+
+    -- GetPath identifies both custom folders and stock game songs. Resolve
+    -- those paths before calling Song:IsCustom: on some builds that reflected
+    -- method can stall during repeated Results polling. A custom folder path
+    -- takes precedence over the method's return value.
+    local custom = nil
+    if isCustomPath then
+        custom = true
+    elseif isOfficialPath then
+        custom = false
+    end
+    if custom == false then
+        state.custom = false
+        state.songId = nil
+        state.songFolder = nil
+        state.songMetadata = nil
+        state.resolutionKey = "official|" .. tostring(songPath) .. "|" .. tostring(state.beatmap or "")
+        state.resolutionGeneration = (state.resolutionGeneration or 0) + 1
+        state.resolutionPending = false
+        if not state.diagnostics.officialSongPath then
+            state.diagnostics.officialSongPath = true
+            log("info", "active song uses an official SongsData path; catalog lookup skipped")
+        end
+        return true
+    end
+    if custom == nil then
+        state.diagnostics.customFlagProbes = state.diagnostics.customFlagProbes or {}
+        state.diagnostics.customFlags = state.diagnostics.customFlags or {}
+        local alreadyProbed = state.diagnostics.customFlagProbes[songObjectPath]
+        if not alreadyProbed and song ~= nil then
+            state.diagnostics.customFlagProbes[songObjectPath] = true
+            state.diagnostics.customFlags[songObjectPath] = safeCall(function()
+                return extractBoolean(song:IsCustom())
+            end, nil)
+        end
+        if songObjectPath ~= nil then
+            custom = state.diagnostics.customFlags[songObjectPath]
+        end
+        if custom == false then
+            state.custom = false
+            state.songId = nil
+            state.songFolder = nil
+            state.songMetadata = nil
+            state.resolutionKey = "noncustom|" .. tostring(songObjectPath) .. "|" .. tostring(state.beatmap or "")
+            state.resolutionGeneration = (state.resolutionGeneration or 0) + 1
+            state.resolutionPending = false
+            return true
+        end
+    end
+    if custom == nil or folder == nil then
+        -- A song with no local custom-folder path cannot be matched uniquely
+        -- by the API. Stop reflecting it on every Results poll; a later run
+        -- gets a fresh capture after Results closes.
+        state.custom = custom
+        state.songId = nil
+        state.songFolder = nil
+        state.songMetadata = nil
+        state.resolutionKey = "unresolved|" .. tostring(songObjectPath) .. "|" .. tostring(state.beatmap or "")
+        state.resolutionGeneration = (state.resolutionGeneration or 0) + 1
+        state.resolutionPending = false
+        if not state.diagnostics.unresolvedSongPath then
+            state.diagnostics.unresolvedSongPath = true
+            log("warn", "active song has no resolvable CustomSongs folder; catalog lookup skipped")
+        end
+        return true
+    end
+    if isCustomPath then custom = true end
     local metadata = safeCall(function() return songMetadata(song, beatMap) end, {
         title = nil,
         artist = nil,
@@ -1614,6 +1686,14 @@ local function poll()
         log("info", "Results UI polling started")
     end
     local panel, panelName, mode = findActiveResultsPanel()
+    if panel == nil then
+        -- A completed run may reuse the same persistent BeatManager for the
+        -- next song. Reset capture state while Results is closed so the next
+        -- Results panel is resolved even when the manager object path is
+        -- unchanged.
+        state.captureManagerPath = nil
+        state.captureResolved = false
+    end
     if state.voteLoadPending and state.widgets ~= nil then
         state.voteLoadPending = false
         loadVote()
