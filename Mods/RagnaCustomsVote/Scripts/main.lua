@@ -1518,9 +1518,33 @@ local function resolvePlayedSongState(manager)
     end
     log("info", "song resolution probe beatmap=" .. tostring(state.beatmap)
         .. " beatMap=" .. tostring(beatMap))
-    local rawCustom = song and safeCall(function()
-        return song:IsCustom()
-    end, nil) or nil
+    -- Keep an explicit false result. Using `and ... or nil` here discarded
+    -- false and sent built-in songs through the custom-song folder/metadata
+    -- reflection below on every Results poll. Those reflected getters can
+    -- stall UE4SS when the Results widget and active BeatManager are changing.
+    local rawCustom = nil
+    if song ~= nil then
+        log("info", "checking active song custom flag")
+        rawCustom = safeCall(function()
+            return song:IsCustom()
+        end, nil)
+    end
+    local custom = extractBoolean(rawCustom)
+    log("info", "active song custom flag resolved value=" .. tostring(custom))
+    if custom == false then
+        state.custom = false
+        state.songId = nil
+        state.songFolder = nil
+        state.songMetadata = nil
+        state.resolutionKey = nil
+        state.resolutionGeneration = (state.resolutionGeneration or 0) + 1
+        state.resolutionPending = false
+        if not state.diagnostics.nonCustomSong then
+            state.diagnostics.nonCustomSong = true
+            log("info", "active Results song is not custom; skipping catalog reflection")
+        end
+        return true
+    end
     local folderOk, folder = pcall(function()
         return loadedSongFolder(song) or loadedSongFolder(beatMap) or loadedSongFolder(manager)
     end)
@@ -1565,7 +1589,6 @@ local function resolvePlayedSongState(manager)
         state.songMetadata = metadata
         resolveCatalogId(folder, metadata, state.resolutionGeneration)
     end
-    local custom = extractBoolean(rawCustom)
     if custom ~= nil then
         state.custom = custom
     end
