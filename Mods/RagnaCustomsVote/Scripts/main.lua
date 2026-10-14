@@ -108,6 +108,8 @@ _G.__ragnaCustomsVoteState = state
 state.diagnostics = state.diagnostics or {}
 state.recoveryAttempts = state.recoveryAttempts or 0
 state.recoveryQueued = state.recoveryQueued or false
+state.removeQueued = state.removeQueued or false
+state.voteDetailsDispatchQueued = state.voteDetailsDispatchQueued or false
 state.voteDetailsPending = state.voteDetailsPending or false
 state.voteDetailsRequest = state.voteDetailsRequest or nil
 state.voteLoadPending = state.voteLoadPending or false
@@ -588,15 +590,14 @@ local function makeButton(canvas, context, mode, label, geometry)
     if not valid(root) then
         return nil
     end
-    safeCall(function()
-        root:SetVisibility(0)
-        root:SetRenderOpacity(1.0)
-        root:SetIsEnabled(true)
-        -- Keep the generated wrapper from acquiring Slate focus on click.
-        -- Its Blueprint focus state can repaint the nested button yellow even
-        -- when the nested UButton itself is non-focusable.
-        root:SetIsFocusable(false)
-    end, nil)
+    if mode ~= "flat" then
+        safeCall(function()
+            root:SetVisibility(0)
+            root:SetRenderOpacity(1.0)
+            root:SetIsEnabled(true)
+            root:SetIsFocusable(false)
+        end, nil)
+    end
     local child = safeCall(function() return root:GetPropertyValue("Text_") end, nil)
     local childClass = valid(child) and safeCall(function()
         return child:GetClass():GetFullName()
@@ -619,24 +620,22 @@ local function makeButton(canvas, context, mode, label, geometry)
     -- The wrapper is the owned input surface and is sufficient for layout,
     -- tinting, and the class-level press hook.
     log("info", "vote button wrapper layout begin label=" .. tostring(label))
-    safeCall(function()
-        root:SetRenderTransformPivot({ X = 0.0, Y = 0.0 })
-        -- FlatInGameButton's authored content is approximately 300x70. VR
-        -- needs a larger hit target and readable label at the Results board's
-        -- world-space scale.
-        if mode == "flat" then
-            root:SetRenderScale({ X = 0.36, Y = 0.6 })
-        else
+    -- Keep the flat Results path to one simple transform call. On repeated
+    -- Results screens SetRenderTransformPivot/Translation/Opacity can stall
+    -- the game thread while the Blueprint wrapper is being attached.
+    if mode == "flat" then
+        safeCall(function() root:SetRenderScale({ X = 0.36, Y = 0.6 }) end, nil)
+    else
+        safeCall(function()
+            root:SetRenderTransformPivot({ X = 0.0, Y = 0.0 })
             -- The native VR scoreboard surface is 840x195. Keep the
             -- authored button content inside its slot; scaling it beyond the
             -- slot makes the icon/count disappear at the right edge.
-            -- Leave horizontal room for the full numeric count, including
-            -- four-digit values, without clipping the authored button.
             root:SetRenderScale({ X = 0.96, Y = 1.0 })
-        end
-        root:SetRenderOpacity(1.0)
-        root:SetRenderTransformTranslation({ X = 0.0, Y = 0.0 })
-    end, nil)
+            root:SetRenderOpacity(1.0)
+            root:SetRenderTransformTranslation({ X = 0.0, Y = 0.0 })
+        end, nil)
+    end
     log("info", "vote button wrapper layout done label=" .. tostring(label))
     local attached = addToCanvas(canvas, root, geometry)
     if not attached then
@@ -696,13 +695,14 @@ local function removeWidgets()
     local widgets = state.widgets
     if widgets ~= nil then
         for _, entry in pairs(widgets) do
-            local candidates = type(entry) == "table"
-                and { entry.root, entry.button, entry.text, entry.component }
-                or { entry }
-            for _, widget in ipairs(candidates) do
-                if valid(widget) then
-                    safeCall(function() widget:RemoveFromParent() end, nil)
-                end
+            -- makeButton records the same owned widget as both root and
+            -- button. Detach the parent wrapper once; its nested Text_ child
+            -- is removed with it.
+            local widget = type(entry) == "table"
+                and (entry.root or entry.button or entry.component)
+                or entry
+            if valid(widget) then
+                safeCall(function() widget:RemoveFromParent() end, nil)
             end
         end
     end
@@ -716,6 +716,29 @@ local function removeWidgets()
     state.loadedSongId = nil
     state.phase = "hidden"
     state.pressed = { up = false, down = false }
+end
+
+local function queueRemoveWidgets(onlyIfResultsClosed)
+    if state.widgets == nil or state.removeQueued then
+        return
+    end
+    state.removeQueued = true
+    local queued, err = executeOnGameThread(function()
+        state.removeQueued = false
+        if state.widgets == nil then
+            return
+        end
+        if not onlyIfResultsClosed or findActiveResultsPanel() == nil then
+            removeWidgets()
+        end
+    end)
+    if not queued then
+        state.removeQueued = false
+        if not state.diagnostics.removeQueueError then
+            state.diagnostics.removeQueueError = true
+            log("error", "could not queue Results widget cleanup on game thread: " .. tostring(err))
+        end
+    end
 end
 
 local function renderNow()
@@ -1261,6 +1284,10 @@ local function loadedSongFolder(object, allowRelated)
     local objectPath = object ~= nil and tostring(fullName(object)) or nil
     state.diagnostics.pathFunctionProbes = state.diagnostics.pathFunctionProbes or {}
     state.diagnostics.pathValues = state.diagnostics.pathValues or {}
+    local cachedPath = objectPath and state.diagnostics.pathValues[objectPath] or nil
+    if cachedPath ~= nil and cachedPath ~= "" then
+        table.insert(candidates, cachedPath)
+    end
     if object ~= nil and not state.diagnostics.pathFunctionProbes[objectPath] then
         state.diagnostics.pathFunctionProbes[objectPath] = true
         local getterNames = { "GetPath" }
@@ -1725,13 +1752,31 @@ local function poll()
         state.voteLoadPending = false
         loadVote()
     end
-    if state.voteDetailsPending and type(state.voteDetailsRequest) == "function"
-        and state.widgets ~= nil then
-        log("info", "vote details pending worker poll; starting request")
+    if state.voteDetailsPending and not state.voteDetailsDispatchQueued
+        and type(state.voteDetailsRequest) == "function" and state.widgets ~= nil then
+        log("info", "vote details pending worker poll; queueing request on game thread")
         local request = state.voteDetailsRequest
+        local requestSongId = state.songId
         state.voteDetailsRequest = nil
         state.voteDetailsPending = false
-        request()
+        state.voteDetailsDispatchQueued = true
+        local queued, err = executeOnGameThread(function()
+            state.voteDetailsDispatchQueued = false
+            if state.widgets == nil or tostring(state.songId) ~= tostring(requestSongId) then
+                return
+            end
+            log("info", "vote details request starting on game thread id=" .. tostring(requestSongId))
+            request()
+        end)
+        if not queued then
+            state.voteDetailsDispatchQueued = false
+            state.voteDetailsRequest = request
+            state.voteDetailsPending = true
+            if not state.diagnostics.voteDetailsDispatchError then
+                state.diagnostics.voteDetailsDispatchError = true
+                log("error", "could not queue vote details request on game thread: " .. tostring(err))
+            end
+        end
     end
     local manager, managerName = nil, nil
     if panel ~= nil then
@@ -1762,7 +1807,7 @@ local function poll()
         state.resolutionPending = false
         state.captureManagerPath = nil
         state.captureResolved = false
-        if state.widgets ~= nil then removeWidgets() end
+        if state.widgets ~= nil then queueRemoveWidgets(false) end
     elseif valid(manager) then
         state.diagnostics.missingPlayedSongManager = nil
     end
@@ -1797,7 +1842,7 @@ local function poll()
             log("info", "vote panel suppressed reason=" .. reason)
         end
         if state.widgets ~= nil and panel == nil then
-            removeWidgets()
+            queueRemoveWidgets(true)
         end
         return
     end
@@ -1842,9 +1887,9 @@ local function poll()
         executeOnGameThread(createOnGameThread)
         return
     end
-    -- Re-apply the base/hover variant on the game thread so Slate focus
-    -- changes are reflected without touching UMG from LoopAsync's worker.
-    render()
+    -- Creation, API responses, and vote presses repaint the visible state.
+    -- Avoid mutating the reused Results Slate tree on every poll; redundant
+    -- UMG writes here can stall later Results screens in the same session.
 end
 
 local function protectedPoll()
