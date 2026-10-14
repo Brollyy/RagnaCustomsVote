@@ -1254,12 +1254,14 @@ local function property(object, names)
     return nil
 end
 
-local function loadedSongFolder(object)
+local function loadedSongFolder(object, allowRelated)
     local candidates = {
         state.liveSongPath,
     }
-    if object ~= nil and not state.diagnostics.pathFunctionProbe then
-        state.diagnostics.pathFunctionProbe = true
+    local objectPath = object ~= nil and tostring(fullName(object)) or nil
+    state.diagnostics.pathFunctionProbes = state.diagnostics.pathFunctionProbes or {}
+    if object ~= nil and not state.diagnostics.pathFunctionProbes[objectPath] then
+        state.diagnostics.pathFunctionProbes[objectPath] = true
         local getterNames = { "GetPath" }
         for _, getterName in ipairs(getterNames) do
             local raw = safeCall(function() return invokeMember(object, getterName) end, nil)
@@ -1290,10 +1292,11 @@ local function loadedSongFolder(object)
             if path ~= nil and path ~= "" then return path end
         end
     end
-    state.diagnostics.pathProbe = true
-    local nested = relatedSong(object)
-    if nested ~= nil and nested ~= object then
-        return loadedSongFolder(nested)
+    if allowRelated == true then
+        local nested = relatedSong(object)
+        if nested ~= nil and nested ~= object then
+            return loadedSongFolder(nested, false)
+        end
     end
     return nil
 end
@@ -1518,35 +1521,17 @@ local function resolvePlayedSongState(manager)
     end
     log("info", "song resolution probe beatmap=" .. tostring(state.beatmap)
         .. " beatMap=" .. tostring(beatMap))
-    -- Keep an explicit false result. Using `and ... or nil` here discarded
-    -- false and sent built-in songs through the custom-song folder/metadata
-    -- reflection below on every Results poll. Those reflected getters can
-    -- stall UE4SS when the Results widget and active BeatManager are changing.
-    local rawCustom = nil
-    if song ~= nil then
-        log("info", "checking active song custom flag")
-        rawCustom = safeCall(function()
-            return song:IsCustom()
-        end, nil)
-    end
+    local rawCustom = song and safeCall(function()
+        return song:IsCustom()
+    end, nil) or nil
     local custom = extractBoolean(rawCustom)
-    log("info", "active song custom flag resolved value=" .. tostring(custom))
-    if custom == false then
-        state.custom = false
-        state.songId = nil
-        state.songFolder = nil
-        state.songMetadata = nil
-        state.resolutionKey = nil
-        state.resolutionGeneration = (state.resolutionGeneration or 0) + 1
-        state.resolutionPending = false
-        if not state.diagnostics.nonCustomSong then
-            state.diagnostics.nonCustomSong = true
-            log("info", "active Results song is not custom; skipping catalog reflection")
-        end
-        return true
-    end
     local folderOk, folder = pcall(function()
-        return loadedSongFolder(song) or loadedSongFolder(beatMap) or loadedSongFolder(manager)
+        -- The manager already yielded the active Song and BeatMap above.
+        -- Query each object's path once per object; don't call GetSong on the
+        -- Song itself or repeat the same reflected traversal on every poll.
+        return loadedSongFolder(song, false)
+            or loadedSongFolder(beatMap, false)
+            or loadedSongFolder(manager, true)
     end)
     if not folderOk then
         log("warn", "live song folder resolver error=" .. tostring(folder))
