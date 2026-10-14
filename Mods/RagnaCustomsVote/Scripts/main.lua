@@ -1112,7 +1112,13 @@ local function findPlayedSongManager()
         for _, manager in ipairs(managers or {}) do
             if valid(manager) then
                 local managerName = fullName(manager)
-                if managerName:find("/Engine/Transient.", 1, true) ~= nil
+                -- Results panels and managers live in different outer objects:
+                -- the panel is transient, while FlatBeatManager_C is owned by
+                -- MainSolo's PersistentLevel in the current game build.
+                -- Accept either live object path and reject template/helpers.
+                local isLiveManager = managerName:find("/Engine/Transient.", 1, true) ~= nil
+                    or managerName:find(":PersistentLevel.", 1, true) ~= nil
+                if isLiveManager
                     and managerName:find("Default__", 1, true) == nil
                     and managerName:find("Latency", 1, true) == nil then
                     return manager, managerName
