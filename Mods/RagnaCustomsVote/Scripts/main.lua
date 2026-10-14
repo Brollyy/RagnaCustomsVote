@@ -1467,8 +1467,31 @@ local function resolveCatalogId(folder, metadata, generation)
         end
     end
     local cached = type(Api.readInstalledSongId) == "function" and safeCall(function() return Api.readInstalledSongId(folder) end, nil) or nil
+    local mapperFallbackAttempted = false
     local function discovered(id, err, result)
         if err ~= nil then
+            -- The local mapper name can differ from the catalog account name
+            -- (for example, an info.dat author of "Vred_0" versus catalog
+            -- mapper "vred"). Keep the strict mapper match first, then retry
+            -- only when it produced no candidates. A title/artist search that
+            -- still has multiple matches remains unresolved in the API.
+            if type(err) == "table" and err.code == "song_id_unresolved"
+                and tonumber(err.matches) == 0 and metadata.mapper ~= nil
+                and metadata.mapper ~= "" and not mapperFallbackAttempted then
+                mapperFallbackAttempted = true
+                local fallbackMetadata = {
+                    title = metadata.title,
+                    artist = metadata.artist,
+                    difficulties = metadata.difficulties,
+                }
+                log("info", "strict catalog match found no candidates; retrying without mapper")
+                local fallbackRequest = Api.discoverInstalledSongId(folder, fallbackMetadata, {
+                    existingId = cached,
+                    callback = discovered,
+                })
+                log("info", "catalog fallback request returned type=" .. type(fallbackRequest))
+                return
+            end
             finish(nil, "catalog discovery failed: " .. tostring(err.message or err))
             return
         end
@@ -1478,7 +1501,11 @@ local function resolveCatalogId(folder, metadata, generation)
             replaced = "replaced invalid loaded song .id from metadata search",
             resolved = "resolved loaded song by metadata search and cached",
         }
-        finish(id, messages[status] or messages.resolved)
+        local message = messages[status] or messages.resolved
+        if mapperFallbackAttempted then
+            message = "resolved loaded song by title and artist fallback and cached"
+        end
+        finish(id, message)
     end
     if type(Api.discoverInstalledSongId) ~= "function" then
         finish(nil, "RagnaCustomsApi does not provide discoverInstalledSongId")
