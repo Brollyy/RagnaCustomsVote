@@ -108,6 +108,8 @@ _G.__ragnaCustomsVoteState = state
 state.diagnostics = state.diagnostics or {}
 state.recoveryAttempts = state.recoveryAttempts or 0
 state.recoveryQueued = state.recoveryQueued or false
+state.removeQueued = state.removeQueued or false
+state.voteDetailsDispatchQueued = state.voteDetailsDispatchQueued or false
 state.voteDetailsPending = state.voteDetailsPending or false
 state.voteDetailsRequest = state.voteDetailsRequest or nil
 state.voteLoadPending = state.voteLoadPending or false
@@ -588,15 +590,14 @@ local function makeButton(canvas, context, mode, label, geometry)
     if not valid(root) then
         return nil
     end
-    safeCall(function()
-        root:SetVisibility(0)
-        root:SetRenderOpacity(1.0)
-        root:SetIsEnabled(true)
-        -- Keep the generated wrapper from acquiring Slate focus on click.
-        -- Its Blueprint focus state can repaint the nested button yellow even
-        -- when the nested UButton itself is non-focusable.
-        root:SetIsFocusable(false)
-    end, nil)
+    if mode ~= "flat" then
+        safeCall(function()
+            root:SetVisibility(0)
+            root:SetRenderOpacity(1.0)
+            root:SetIsEnabled(true)
+            root:SetIsFocusable(false)
+        end, nil)
+    end
     local child = safeCall(function() return root:GetPropertyValue("Text_") end, nil)
     local childClass = valid(child) and safeCall(function()
         return child:GetClass():GetFullName()
@@ -619,24 +620,22 @@ local function makeButton(canvas, context, mode, label, geometry)
     -- The wrapper is the owned input surface and is sufficient for layout,
     -- tinting, and the class-level press hook.
     log("info", "vote button wrapper layout begin label=" .. tostring(label))
-    safeCall(function()
-        root:SetRenderTransformPivot({ X = 0.0, Y = 0.0 })
-        -- FlatInGameButton's authored content is approximately 300x70. VR
-        -- needs a larger hit target and readable label at the Results board's
-        -- world-space scale.
-        if mode == "flat" then
-            root:SetRenderScale({ X = 0.36, Y = 0.6 })
-        else
+    -- Keep the flat Results path to one simple transform call. On repeated
+    -- Results screens SetRenderTransformPivot/Translation/Opacity can stall
+    -- the game thread while the Blueprint wrapper is being attached.
+    if mode == "flat" then
+        safeCall(function() root:SetRenderScale({ X = 0.36, Y = 0.6 }) end, nil)
+    else
+        safeCall(function()
+            root:SetRenderTransformPivot({ X = 0.0, Y = 0.0 })
             -- The native VR scoreboard surface is 840x195. Keep the
             -- authored button content inside its slot; scaling it beyond the
             -- slot makes the icon/count disappear at the right edge.
-            -- Leave horizontal room for the full numeric count, including
-            -- four-digit values, without clipping the authored button.
             root:SetRenderScale({ X = 0.96, Y = 1.0 })
-        end
-        root:SetRenderOpacity(1.0)
-        root:SetRenderTransformTranslation({ X = 0.0, Y = 0.0 })
-    end, nil)
+            root:SetRenderOpacity(1.0)
+            root:SetRenderTransformTranslation({ X = 0.0, Y = 0.0 })
+        end, nil)
+    end
     log("info", "vote button wrapper layout done label=" .. tostring(label))
     local attached = addToCanvas(canvas, root, geometry)
     if not attached then
@@ -696,13 +695,14 @@ local function removeWidgets()
     local widgets = state.widgets
     if widgets ~= nil then
         for _, entry in pairs(widgets) do
-            local candidates = type(entry) == "table"
-                and { entry.root, entry.button, entry.text, entry.component }
-                or { entry }
-            for _, widget in ipairs(candidates) do
-                if valid(widget) then
-                    safeCall(function() widget:RemoveFromParent() end, nil)
-                end
+            -- makeButton records the same owned widget as both root and
+            -- button. Detach the parent wrapper once; its nested Text_ child
+            -- is removed with it.
+            local widget = type(entry) == "table"
+                and (entry.root or entry.button or entry.component)
+                or entry
+            if valid(widget) then
+                safeCall(function() widget:RemoveFromParent() end, nil)
             end
         end
     end
@@ -716,6 +716,29 @@ local function removeWidgets()
     state.loadedSongId = nil
     state.phase = "hidden"
     state.pressed = { up = false, down = false }
+end
+
+local function queueRemoveWidgets(onlyIfResultsClosed)
+    if state.widgets == nil or state.removeQueued then
+        return
+    end
+    state.removeQueued = true
+    local queued, err = executeOnGameThread(function()
+        state.removeQueued = false
+        if state.widgets == nil then
+            return
+        end
+        if not onlyIfResultsClosed or findActiveResultsPanel() == nil then
+            removeWidgets()
+        end
+    end)
+    if not queued then
+        state.removeQueued = false
+        if not state.diagnostics.removeQueueError then
+            state.diagnostics.removeQueueError = true
+            log("error", "could not queue Results widget cleanup on game thread: " .. tostring(err))
+        end
+    end
 end
 
 local function renderNow()
@@ -1112,7 +1135,13 @@ local function findPlayedSongManager()
         for _, manager in ipairs(managers or {}) do
             if valid(manager) then
                 local managerName = fullName(manager)
-                if managerName:find("/Engine/Transient.", 1, true) ~= nil
+                -- Results panels and managers live in different outer objects:
+                -- the panel is transient, while FlatBeatManager_C is owned by
+                -- MainSolo's PersistentLevel in the current game build.
+                -- Accept either live object path and reject template/helpers.
+                local isLiveManager = managerName:find("/Engine/Transient.", 1, true) ~= nil
+                    or managerName:find(":PersistentLevel.", 1, true) ~= nil
+                if isLiveManager
                     and managerName:find("Default__", 1, true) == nil
                     and managerName:find("Latency", 1, true) == nil then
                     return manager, managerName
@@ -1121,18 +1150,6 @@ local function findPlayedSongManager()
         end
     end
     return nil
-end
-
-local function findLiveSongObject(className)
-    if type(FindFirstOf) ~= "function" then return nil end
-    local object = safeCall(function() return FindFirstOf(className) end, nil)
-    if not valid(object) then return nil end
-    local name = fullName(object)
-    if name:find("/Engine/Transient.", 1, true) == nil
-        or name:find("Default__", 1, true) ~= nil then
-        return nil
-    end
-    return object
 end
 
 local function extractSongId(value)
@@ -1260,17 +1277,25 @@ local function property(object, names)
     return nil
 end
 
-local function loadedSongFolder(object)
+local function loadedSongFolder(object, allowRelated)
     local candidates = {
         state.liveSongPath,
     }
-    if object ~= nil and not state.diagnostics.pathFunctionProbe then
-        state.diagnostics.pathFunctionProbe = true
+    local objectPath = object ~= nil and tostring(fullName(object)) or nil
+    state.diagnostics.pathFunctionProbes = state.diagnostics.pathFunctionProbes or {}
+    state.diagnostics.pathValues = state.diagnostics.pathValues or {}
+    local cachedPath = objectPath and state.diagnostics.pathValues[objectPath] or nil
+    if cachedPath ~= nil and cachedPath ~= "" then
+        table.insert(candidates, cachedPath)
+    end
+    if object ~= nil and not state.diagnostics.pathFunctionProbes[objectPath] then
+        state.diagnostics.pathFunctionProbes[objectPath] = true
         local getterNames = { "GetPath" }
         for _, getterName in ipairs(getterNames) do
             local raw = safeCall(function() return invokeMember(object, getterName) end, nil)
             local candidate = textValue(raw)
             if candidate ~= nil and candidate ~= "" then
+                state.diagnostics.pathValues[objectPath] = candidate
                 table.insert(candidates, candidate)
                 log("info", "live song path getter=" .. getterName .. " value=" .. candidate)
             end
@@ -1296,10 +1321,11 @@ local function loadedSongFolder(object)
             if path ~= nil and path ~= "" then return path end
         end
     end
-    state.diagnostics.pathProbe = true
-    local nested = relatedSong(object)
-    if nested ~= nil and nested ~= object then
-        return loadedSongFolder(nested)
+    if allowRelated == true then
+        local nested = relatedSong(object)
+        if nested ~= nil and nested ~= object then
+            return loadedSongFolder(nested, false)
+        end
     end
     return nil
 end
@@ -1468,8 +1494,31 @@ local function resolveCatalogId(folder, metadata, generation)
         end
     end
     local cached = type(Api.readInstalledSongId) == "function" and safeCall(function() return Api.readInstalledSongId(folder) end, nil) or nil
+    local mapperFallbackAttempted = false
     local function discovered(id, err, result)
         if err ~= nil then
+            -- The local mapper name can differ from the catalog account name
+            -- (for example, an info.dat author of "Vred_0" versus catalog
+            -- mapper "vred"). Keep the strict mapper match first, then retry
+            -- only when it produced no candidates. A title/artist search that
+            -- still has multiple matches remains unresolved in the API.
+            if type(err) == "table" and err.code == "song_id_unresolved"
+                and tonumber(err.matches) == 0 and metadata.mapper ~= nil
+                and metadata.mapper ~= "" and not mapperFallbackAttempted then
+                mapperFallbackAttempted = true
+                local fallbackMetadata = {
+                    title = metadata.title,
+                    artist = metadata.artist,
+                    difficulties = metadata.difficulties,
+                }
+                log("info", "strict catalog match found no candidates; retrying without mapper")
+                local fallbackRequest = Api.discoverInstalledSongId(folder, fallbackMetadata, {
+                    existingId = cached,
+                    callback = discovered,
+                })
+                log("info", "catalog fallback request returned type=" .. type(fallbackRequest))
+                return
+            end
             finish(nil, "catalog discovery failed: " .. tostring(err.message or err))
             return
         end
@@ -1479,7 +1528,11 @@ local function resolveCatalogId(folder, metadata, generation)
             replaced = "replaced invalid loaded song .id from metadata search",
             resolved = "resolved loaded song by metadata search and cached",
         }
-        finish(id, messages[status] or messages.resolved)
+        local message = messages[status] or messages.resolved
+        if mapperFallbackAttempted then
+            message = "resolved loaded song by title and artist fallback and cached"
+        end
+        finish(id, message)
     end
     if type(Api.discoverInstalledSongId) ~= "function" then
         finish(nil, "RagnaCustomsApi does not provide discoverInstalledSongId")
@@ -1493,20 +1546,24 @@ local function resolveCatalogId(folder, metadata, generation)
     log("info", "catalog discovery request returned type=" .. type(discoveryRequest))
 end
 
+-- Keep the played-song identity attached to its manager. Globally enumerated
+-- Song objects include catalog entries that are unrelated to the Results run.
+local function managerSongReferences(manager, isValid, readMember)
+    if not isValid(manager) then return nil, nil, false end
+    return readMember(manager, "GetSong", "m_song"),
+        readMember(manager, "GetBeatMap", "m_beatMap"), true
+end
+
 local function resolvePlayedSongState(manager)
-    if not valid(manager) and not valid(state.liveSong) and not valid(state.liveBeatMap) then
-        return false
+    -- Global Song/BeatMap objects include category and selector catalog entries.
+    -- They are not evidence of what was just played, so only resolve from the
+    -- active BeatManager that owns the completed run.
+    local function readManagerMember(object, getter, field)
+        return safeCall(function() return invokeMember(object, getter) end,
+            safeCall(function() return object[field] end, nil))
     end
-    local song = valid(manager) and safeCall(function()
-        return manager:GetSong()
-    end, safeCall(function()
-        return manager.m_song
-    end, nil)) or state.liveSong or relatedSong(state.liveBeatMap)
-    local beatMap = valid(manager) and safeCall(function()
-        return manager:GetBeatMap()
-    end, safeCall(function()
-        return manager.m_beatMap
-    end, nil)) or state.liveBeatMap
+    local song, beatMap, managerValid = managerSongReferences(manager, valid, readManagerMember)
+    if not managerValid then return false end
     log("info", "live song objects manager=" .. tostring(valid(manager) and fullName(manager) or "nil")
         .. " song=" .. tostring(song ~= nil and fullName(song) or "nil")
         .. " beatMap=" .. tostring(beatMap ~= nil and fullName(beatMap) or "nil"))
@@ -1520,16 +1577,92 @@ local function resolvePlayedSongState(manager)
     end
     log("info", "song resolution probe beatmap=" .. tostring(state.beatmap)
         .. " beatMap=" .. tostring(beatMap))
-    local rawCustom = song and safeCall(function()
-        return song:IsCustom()
-    end, nil) or nil
     local folderOk, folder = pcall(function()
-        return loadedSongFolder(song) or loadedSongFolder(beatMap) or loadedSongFolder(manager)
+        -- The manager already yielded the active Song and BeatMap above.
+        -- Query each object's path once per object; don't call GetSong on the
+        -- Song itself or repeat the same reflected traversal on every poll.
+        return loadedSongFolder(song, false)
+            or loadedSongFolder(beatMap, false)
+            or loadedSongFolder(manager, true)
     end)
     if not folderOk then
         log("warn", "live song folder resolver error=" .. tostring(folder))
         folder = nil
     end
+    local songObjectPath = song ~= nil and tostring(fullName(song)) or nil
+    state.diagnostics.pathValues = state.diagnostics.pathValues or {}
+    local songPath = songObjectPath and state.diagnostics.pathValues[songObjectPath] or nil
+    local normalizedSongPath = type(songPath) == "string"
+        and string.lower(songPath:gsub("\\", "/"):gsub("/+", "/")) or ""
+    local isCustomPath = folder ~= nil or normalizedSongPath:find("customsongs/", 1, true) ~= nil
+    local isOfficialPath = normalizedSongPath:find("/content/songsdata/", 1, true) ~= nil
+
+    -- GetPath identifies both custom folders and stock game songs. Resolve
+    -- those paths before calling Song:IsCustom: on some builds that reflected
+    -- method can stall during repeated Results polling. A custom folder path
+    -- takes precedence over the method's return value.
+    local custom = nil
+    if isCustomPath then
+        custom = true
+    elseif isOfficialPath then
+        custom = false
+    end
+    if custom == false then
+        state.custom = false
+        state.songId = nil
+        state.songFolder = nil
+        state.songMetadata = nil
+        state.resolutionKey = "official|" .. tostring(songPath) .. "|" .. tostring(state.beatmap or "")
+        state.resolutionGeneration = (state.resolutionGeneration or 0) + 1
+        state.resolutionPending = false
+        if not state.diagnostics.officialSongPath then
+            state.diagnostics.officialSongPath = true
+            log("info", "active song uses an official SongsData path; catalog lookup skipped")
+        end
+        return true
+    end
+    if custom == nil then
+        state.diagnostics.customFlagProbes = state.diagnostics.customFlagProbes or {}
+        state.diagnostics.customFlags = state.diagnostics.customFlags or {}
+        local alreadyProbed = state.diagnostics.customFlagProbes[songObjectPath]
+        if not alreadyProbed and song ~= nil then
+            state.diagnostics.customFlagProbes[songObjectPath] = true
+            state.diagnostics.customFlags[songObjectPath] = safeCall(function()
+                return extractBoolean(song:IsCustom())
+            end, nil)
+        end
+        if songObjectPath ~= nil then
+            custom = state.diagnostics.customFlags[songObjectPath]
+        end
+        if custom == false then
+            state.custom = false
+            state.songId = nil
+            state.songFolder = nil
+            state.songMetadata = nil
+            state.resolutionKey = "noncustom|" .. tostring(songObjectPath) .. "|" .. tostring(state.beatmap or "")
+            state.resolutionGeneration = (state.resolutionGeneration or 0) + 1
+            state.resolutionPending = false
+            return true
+        end
+    end
+    if custom == nil or folder == nil then
+        -- A song with no local custom-folder path cannot be matched uniquely
+        -- by the API. Stop reflecting it on every Results poll; a later run
+        -- gets a fresh capture after Results closes.
+        state.custom = custom
+        state.songId = nil
+        state.songFolder = nil
+        state.songMetadata = nil
+        state.resolutionKey = "unresolved|" .. tostring(songObjectPath) .. "|" .. tostring(state.beatmap or "")
+        state.resolutionGeneration = (state.resolutionGeneration or 0) + 1
+        state.resolutionPending = false
+        if not state.diagnostics.unresolvedSongPath then
+            state.diagnostics.unresolvedSongPath = true
+            log("warn", "active song has no resolvable CustomSongs folder; catalog lookup skipped")
+        end
+        return true
+    end
+    if isCustomPath then custom = true end
     local metadata = safeCall(function() return songMetadata(song, beatMap) end, {
         title = nil,
         artist = nil,
@@ -1567,7 +1700,6 @@ local function resolvePlayedSongState(manager)
         state.songMetadata = metadata
         resolveCatalogId(folder, metadata, state.resolutionGeneration)
     end
-    local custom = extractBoolean(rawCustom)
     if custom ~= nil then
         state.custom = custom
     end
@@ -1608,30 +1740,50 @@ local function poll()
         log("info", "Results UI polling started")
     end
     local panel, panelName, mode = findActiveResultsPanel()
+    if panel == nil then
+        -- A completed run may reuse the same persistent BeatManager for the
+        -- next song. Reset capture state while Results is closed so the next
+        -- Results panel is resolved even when the manager object path is
+        -- unchanged.
+        state.captureManagerPath = nil
+        state.captureResolved = false
+    end
     if state.voteLoadPending and state.widgets ~= nil then
         state.voteLoadPending = false
         loadVote()
     end
-    if state.voteDetailsPending and type(state.voteDetailsRequest) == "function"
-        and state.widgets ~= nil then
-        log("info", "vote details pending worker poll; starting request")
+    if state.voteDetailsPending and not state.voteDetailsDispatchQueued
+        and type(state.voteDetailsRequest) == "function" and state.widgets ~= nil then
+        log("info", "vote details pending worker poll; queueing request on game thread")
         local request = state.voteDetailsRequest
+        local requestSongId = state.songId
         state.voteDetailsRequest = nil
         state.voteDetailsPending = false
-        request()
+        state.voteDetailsDispatchQueued = true
+        local queued, err = executeOnGameThread(function()
+            state.voteDetailsDispatchQueued = false
+            if state.widgets == nil or tostring(state.songId) ~= tostring(requestSongId) then
+                return
+            end
+            log("info", "vote details request starting on game thread id=" .. tostring(requestSongId))
+            request()
+        end)
+        if not queued then
+            state.voteDetailsDispatchQueued = false
+            state.voteDetailsRequest = request
+            state.voteDetailsPending = true
+            if not state.diagnostics.voteDetailsDispatchError then
+                state.diagnostics.voteDetailsDispatchError = true
+                log("error", "could not queue vote details request on game thread: " .. tostring(err))
+            end
+        end
     end
     local manager, managerName = nil, nil
     if panel ~= nil then
         manager, managerName = findPlayedSongManager()
-        if not valid(manager) then
-            state.liveSong = findLiveSongObject("Song") or state.liveSong
-            state.liveBeatMap = findLiveSongObject("BeatMap") or state.liveBeatMap
-        end
     end
     local liveObjectPath = managerName
-        or (valid(state.liveSong) and fullName(state.liveSong))
-        or (valid(state.liveBeatMap) and fullName(state.liveBeatMap) or nil)
-    if panel ~= nil and (valid(manager) or valid(state.liveSong) or valid(state.liveBeatMap)) and not state.captureQueued
+    if panel ~= nil and valid(manager) and not state.captureQueued
         and (state.captureManagerPath ~= liveObjectPath or state.captureResolved ~= true) then
         state.captureQueued = true
         local function captureOnGameThread()
@@ -1641,6 +1793,23 @@ local function poll()
         end
         executeOnGameThread(captureOnGameThread)
         return
+    end
+    if panel ~= nil and not valid(manager) then
+        if not state.diagnostics.missingPlayedSongManager then
+            state.diagnostics.missingPlayedSongManager = true
+            log("warn", "cannot resolve Results song: active BeatManager reference is unavailable")
+        end
+        state.songId = nil
+        state.songFolder = nil
+        state.songMetadata = nil
+        state.resolutionKey = nil
+        state.resolutionGeneration = (state.resolutionGeneration or 0) + 1
+        state.resolutionPending = false
+        state.captureManagerPath = nil
+        state.captureResolved = false
+        if state.widgets ~= nil then queueRemoveWidgets(false) end
+    elseif valid(manager) then
+        state.diagnostics.missingPlayedSongManager = nil
     end
     -- Reflected GameInstance getters are game-thread calls. Probe the single
     -- stable setting once rather than invoking reflection on every poll.
@@ -1673,7 +1842,7 @@ local function poll()
             log("info", "vote panel suppressed reason=" .. reason)
         end
         if state.widgets ~= nil and panel == nil then
-            removeWidgets()
+            queueRemoveWidgets(true)
         end
         return
     end
@@ -1718,9 +1887,9 @@ local function poll()
         executeOnGameThread(createOnGameThread)
         return
     end
-    -- Re-apply the base/hover variant on the game thread so Slate focus
-    -- changes are reflected without touching UMG from LoopAsync's worker.
-    render()
+    -- Creation, API responses, and vote presses repaint the visible state.
+    -- Avoid mutating the reused Results Slate tree on every poll; redundant
+    -- UMG writes here can stall later Results screens in the same session.
 end
 
 local function protectedPoll()
