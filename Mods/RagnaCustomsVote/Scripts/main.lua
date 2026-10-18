@@ -945,8 +945,8 @@ local BUTTON_HANDLER_PATHS = {
     -- flow and receives the wrapped button instance for direction filtering.
     flat = "/Game/Flat/Blueprints/UI/InGame/FlatInGameButton.FlatInGameButton_C:"
         .. "BndEvt__FlatInGameButton_Button_64_K2Node_ComponentBoundEvent_0_OnButtonPressedEvent__DelegateSignature",
-    vr = "/Game/VRKeyboards/Blueprints/Keyboards/BasicPointAndClick/WBP_Button_Basic.WBP_Button_Basic_C:"
-        .. "BndEvt__Button_0_K2Node_ComponentBoundEvent_0_OnButtonPressedEvent__DelegateSignature",
+    vr = "/Game/Flat/Blueprints/UI/InGame/FlatInGameButton.FlatInGameButton_C:"
+        .. "BndEvt__FlatInGameButton_Button_64_K2Node_ComponentBoundEvent_0_OnButtonPressedEvent__DelegateSignature",
 }
 
 local function voteDirectionForClickedButton(...)
@@ -961,6 +961,7 @@ local function voteDirectionForClickedButton(...)
             for _, direction in ipairs({ "up", "down" }) do
                 local entry = widgets[direction]
                 if entry ~= nil and (clickedPath == entry.objectPath
+                    or clickedPath:sub(1, #entry.objectPath + 1) == entry.objectPath .. "."
                     or (entry.innerObjectPath ~= nil and clickedPath == entry.innerObjectPath)) then
                     return direction
                 end
