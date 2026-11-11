@@ -622,6 +622,9 @@ local function addToCanvas(canvas, widget, geometry)
 end
 
 local function createMultiplayerVrLabel(canvas, context, sourceText, label, geometry)
+    -- The multiplayer button slot is much smaller than the solo VR slot.
+    -- An autosized label keeps longer counts centered without altering the
+    -- button's hit target, while copying its typeface and colors.
     local tree = valid(context) and safeCall(function() return context.WidgetTree end, nil) or nil
     local textClass = safeCall(function() return StaticFindObject("Class /Script/UMG.TextBlock") end, nil)
     if not valid(textClass) then
@@ -975,10 +978,8 @@ local function renderNow()
             value = tonumber(value) or 0
             return tostring(value)
         end
-        local upLabel = state.mode == "multiplayer_vr" and "▲" or "▲ "
-        local downLabel = state.mode == "multiplayer_vr" and "▼" or "▼ "
-        local upText = upLabel .. displayCount(state.upvotes)
-        local downText = downLabel .. displayCount(state.downvotes)
+        local upText = "▲ " .. displayCount(state.upvotes)
+        local downText = "▼ " .. displayCount(state.downvotes)
         setVoteLabelText(widgets.up.text, upText)
         setVoteLabelText(widgets.down.text, downText)
         if state.mode == "multiplayer_vr" then
@@ -1079,54 +1080,24 @@ local function installApiEventHandlers()
     if state.apiEventsInstalled then return end
     state.apiEventsInstalled = true
     Api.on("vote.details.completed", function(payload)
-        log("info", "vote API event received name=vote.details.completed id="
-            .. tostring(payload and payload.id) .. " activeId=" .. tostring(state.songId))
         if payload == nil or tostring(payload.id) ~= tostring(state.songId) then return end
         applyResponse(apiVoteResult(payload.response, nil))
     end)
     Api.on("vote.details.failed", function(payload)
-        log("info", "vote API event received name=vote.details.failed id="
-            .. tostring(payload and payload.id) .. " activeId=" .. tostring(state.songId))
         if payload == nil or tostring(payload.id) ~= tostring(state.songId) then return end
         applyResponse(apiVoteResult(nil, payload.error))
     end)
     Api.on("vote.completed", function(payload)
-        log("info", "vote API event received name=vote.completed id="
-            .. tostring(payload and payload.id) .. " activeId=" .. tostring(state.songId))
         if payload == nil or tostring(payload.id) ~= tostring(state.songId) then return end
         applyResponse(apiVoteResult(payload.response, nil))
     end)
     Api.on("vote.failed", function(payload)
-        log("info", "vote API event received name=vote.failed id="
-            .. tostring(payload and payload.id) .. " activeId=" .. tostring(state.songId))
         if payload == nil or tostring(payload.id) ~= tostring(state.songId) then return end
         applyResponse(apiVoteResult(nil, payload.error))
     end)
 end
 
 loadVote = function()
-    local resolvedAt = tonumber(state.catalogResolvedAt)
-    if resolvedAt ~= nil and os and type(os.time) == "function" then
-        local remainingMs = 10500 - math.max(0, os.time() - resolvedAt) * 1000
-        if remainingMs > 0 then
-            if not state.voteDetailsDelayQueued then
-                state.voteDetailsDelayQueued = true
-                log("info", "delaying vote details request until catalog transport is released")
-                local scheduled, err = scheduleWithDelay(remainingMs, function()
-                    state.voteDetailsDelayQueued = false
-                    loadVote()
-                end, "vote details after catalog transport release")
-                if not scheduled then
-                    state.voteDetailsDelayQueued = false
-                    log("warn", "could not delay vote details request: " .. tostring(err))
-                else
-                    return
-                end
-            else
-                return
-            end
-        end
-    end
     state.recoveryQueued = false
     state.phase = "loading"
     -- The initial widgets are already disabled. Avoid queuing an extra Slate
@@ -1135,16 +1106,7 @@ loadVote = function()
     local songId = state.songId
     local function startRequest()
         log("info", "vote details request starting id=" .. tostring(songId))
-        local ok, requestId, err = pcall(Api.getSongVote, songId)
-        if not ok then
-            log("error", "vote details request threw id=" .. tostring(songId)
-                .. " error=" .. tostring(requestId))
-            applyResponse(apiVoteResult(nil, { code = "start_failed", message = requestId }))
-            return
-        end
-        log("info", "vote details API returned id=" .. tostring(songId)
-            .. " request=" .. tostring(requestId)
-            .. (err ~= nil and " error=" .. tostring(err) or ""))
+        local _, err = Api.getSongVote(songId)
         if err ~= nil then
             applyResponse(apiVoteResult(nil, { code = "start_failed", message = err }))
         end
@@ -1200,6 +1162,10 @@ local function cacheMultiplayerVrPointerTarget()
 end
 
 local function installMultiplayerVrPointerHook()
+    -- Solo VR uses the normal Results button handler. Multiplayer VR places
+    -- its buttons on SongInfoWidget, whose world-space ray can report a hit
+    -- without the generated handler identifying the button instance; route
+    -- those presses by the widget-local hit position instead.
     if state.vrPointerHookInstalled or type(RegisterHook) ~= "function" then
         return
     end
@@ -1288,19 +1254,10 @@ local function installMultiplayerVrPointerHook()
         .. (hookError ~= nil and " error=" .. tostring(hookError) or ""))
 end
 
-local BUTTON_HANDLER_PATHS = {
-    -- UE4SS 3.0.1 rejects the native SlateHandleClicked hook on this build.
-    -- The generated Blueprint handler is registered for only the active UI
-    -- flow and receives the wrapped button instance for direction filtering.
-    flat = "/Game/Flat/Blueprints/UI/InGame/FlatInGameButton.FlatInGameButton_C:"
-        .. "BndEvt__FlatInGameButton_Button_64_K2Node_ComponentBoundEvent_0_OnButtonPressedEvent__DelegateSignature",
-    multiplayer = "/Game/Flat/Blueprints/UI/InGame/FlatInGameButton.FlatInGameButton_C:"
-        .. "BndEvt__FlatInGameButton_Button_64_K2Node_ComponentBoundEvent_0_OnButtonPressedEvent__DelegateSignature",
-    multiplayer_vr = "/Game/Flat/Blueprints/UI/InGame/FlatInGameButton.FlatInGameButton_C:"
-        .. "BndEvt__FlatInGameButton_Button_64_K2Node_ComponentBoundEvent_0_OnButtonPressedEvent__DelegateSignature",
-    vr = "/Game/Flat/Blueprints/UI/InGame/FlatInGameButton.FlatInGameButton_C:"
-        .. "BndEvt__FlatInGameButton_Button_64_K2Node_ComponentBoundEvent_0_OnButtonPressedEvent__DelegateSignature",
-}
+-- Every Results flow uses the same stock button Blueprint. UE4SS 3.0.1
+-- rejects its native SlateHandleClicked hook, so use its generated handler.
+local BUTTON_HANDLER_PATH = "/Game/Flat/Blueprints/UI/InGame/FlatInGameButton.FlatInGameButton_C:"
+    .. "BndEvt__FlatInGameButton_Button_64_K2Node_ComponentBoundEvent_0_OnButtonPressedEvent__DelegateSignature"
 
 local function voteDirectionForClickedButton(...)
     local widgets = state.widgets
@@ -1343,15 +1300,12 @@ local function installButtonHooks()
         end
     end
     state.buttonHookCallback = onButtonPressed
-    local handlerPath = BUTTON_HANDLER_PATHS[state.mode]
-    if handlerPath ~= nil then
-        handlerPath = rootReflectionString(handlerPath)
-        local ok, hookError = pcall(RegisterHook, handlerPath, onButtonPressed)
-        log("info", "Results button hook registration path=" .. handlerPath
-            .. " ok=" .. tostring(ok)
-            .. (hookError ~= nil and " error=" .. tostring(hookError) or ""))
-        installed = ok
-    end
+    local handlerPath = rootReflectionString(BUTTON_HANDLER_PATH)
+    local ok, hookError = pcall(RegisterHook, handlerPath, onButtonPressed)
+    log("info", "Results button hook registration path=" .. handlerPath
+        .. " ok=" .. tostring(ok)
+        .. (hookError ~= nil and " error=" .. tostring(hookError) or ""))
+    installed = ok
     state.buttonHooksInstalled = installed
     if not installed then state.buttonHookCallback = nil end
     if installed then
@@ -1370,6 +1324,9 @@ local function createVrWidgets(panelPath, mode)
         return false
     end
     if mode == "multiplayer_vr" then
+        -- SongInfoWidget is narrower than the free area needed beside its
+        -- difficulty badge. Expand the surface and move the badge slots left
+        -- to reserve a clear strip for the vote buttons.
         local drawSize = safeCall(function() return source:GetDrawSize() end, nil)
         local drawHeight = tonumber(drawSize and drawSize.Y) or 310
         local location = safeCall(function() return source:K2_GetComponentLocation() end, nil)
@@ -1932,23 +1889,10 @@ local function resolveCatalogId(folder, metadata, generation)
         state.resolutionPending = false
         if id ~= nil then
             state.songId = tonumber(id)
-            state.catalogResolvedAt = os and type(os.time) == "function" and os.time() or nil
             log("info", message .. " id=" .. tostring(state.songId))
         end
     end
     local cached = type(Api.readInstalledSongId) == "function" and safeCall(function() return Api.readInstalledSongId(folder) end, nil) or nil
-    local cachedId = tonumber(cached)
-    if cachedId ~= nil and cachedId > 0 then
-        -- The API's .id marker is the catalog association saved when this
-        -- custom song was installed. Trust that explicit association and
-        -- avoid overlapping catalog search requests with the Results vote
-        -- state request on this UE4SS/VaRest build.
-        state.songId = cachedId
-        state.catalogResolvedAt = nil
-        state.resolutionPending = false
-        log("info", "using installed catalog ID id=" .. tostring(cachedId))
-        return
-    end
     local mapperFallbackAttempted = false
     local function discovered(id, err, result)
         if err ~= nil then
