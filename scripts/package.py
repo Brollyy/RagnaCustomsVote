@@ -23,7 +23,7 @@ def manifest() -> dict:
         "version": VERSION,
         "author": "Brollyy",
         "game": "ragnarock",
-        "description": "Flat and PC VR Results-screen voting controls for custom songs.",
+        "description": "Flat, multiplayer, and PC VR Results-screen voting controls for custom songs.",
         "requires": {"manager": ">=0.2.0"},
         "dependencies": {"ragnacustoms-api": ">=0.3.0"},
         "conflicts": [],

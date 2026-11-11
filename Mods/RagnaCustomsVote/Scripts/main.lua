@@ -242,6 +242,13 @@ local RESULT_FLOWS = {
         panelClasses = { "FlatInGameEndPanel_C" },
         buttonClass = "/Game/Flat/Blueprints/UI/InGame/FlatInGameButton.FlatInGameButton_C",
     },
+    multiplayer = {
+        panelClasses = { "FlatInGameEndMenuMulti_C" },
+        buttonClass = "/Game/Flat/Blueprints/UI/InGame/FlatInGameButton.FlatInGameButton_C",
+    },
+    multiplayer_vr = {
+        buttonClass = "/Game/Flat/Blueprints/UI/InGame/FlatInGameButton.FlatInGameButton_C",
+    },
     vr = {
         buttonClass = "/Game/Flat/Blueprints/UI/InGame/FlatInGameButton.FlatInGameButton_C",
     },
@@ -273,6 +280,32 @@ local function findFlatResultsPanel()
     return nil
 end
 
+local function findMultiplayerGameMode()
+    if type(FindFirstOf) ~= "function" then return nil end
+    for _, className in ipairs({
+        "FlatGameModeMulti_C",
+        "FlatGameModeMulti",
+        "RagnarockMultiGameMode_C",
+        "RagnarockMultiGameMode",
+    }) do
+        local gameMode = safeCall(function() return FindFirstOf(className) end, nil)
+        if valid(gameMode) then return gameMode end
+    end
+    return nil
+end
+
+local function findMultiplayerResultsPanel()
+    if not valid(findMultiplayerGameMode()) then return nil end
+    local panel, name = findResultsPanelForFlow(RESULT_FLOWS.multiplayer)
+    if panel ~= nil then return panel, name, "multiplayer" end
+    -- The game can reuse the standard Flat Results panel while the active
+    -- world is still FlatGameModeMulti. Keep the multiplayer flow in that
+    -- case so the vote controls are attached to the multiplayer song info.
+    panel, name = findResultsPanelForFlow(RESULT_FLOWS.flat)
+    if panel ~= nil then return panel, name, "multiplayer" end
+    return nil
+end
+
 local function findVrResultsPanel()
     if type(FindAllOf) ~= "function" then
         return nil
@@ -280,17 +313,54 @@ local function findVrResultsPanel()
     -- The visible VR Results board is rendered by one of these live widget
     -- components. Return its UserWidget as the flow anchor; the scoreboard
     -- surface helper performs the component-specific attachment later.
-    for _, componentName in ipairs({ ".SongInfoWidget", ".ScoreboardWidget" }) do
-        for _, component in ipairs(safeCall(function() return FindAllOf("WidgetComponent") end, {}) or {}) do
-            if valid(component) and fullName(component):find(componentName, 1, true) ~= nil then
+    local candidateDiagnostics = {}
+    local components = safeCall(function() return FindAllOf("WidgetComponent") end, {}) or {}
+    for _, component in ipairs(components) do
+        -- Flat mode also constructs the VR result widgets, but keeps their
+        -- WidgetComponents hidden. Only classify a rendered component as VR.
+        if valid(component) then
+            local componentPath = fullName(component)
+            local matchesSurface = componentPath:find(".SongInfoWidget", 1, true) ~= nil
+                or componentPath:find(".ScoreboardWidget", 1, true) ~= nil
+            if matchesSurface then
                 local widget = safeCall(function() return component:GetUserWidgetObject() end, nil)
-                if valid(widget) then
+                local isVisible = safeCall(function() return component:IsVisible() end, false)
+                table.insert(candidateDiagnostics, componentPath
+                    .. " visible=" .. tostring(isVisible)
+                    .. " widget=" .. tostring(valid(widget)))
+                if isVisible and valid(widget) then
+                    local signature = table.concat(candidateDiagnostics, " | ")
+                    if state.diagnostics.vrPanelCandidates ~= signature then
+                        state.diagnostics.vrPanelCandidates = signature
+                        log("info", "VR Results widget candidate selected=" .. componentPath
+                            .. " widget=" .. fullName(widget))
+                    end
                     return widget, fullName(widget), "vr"
                 end
             end
         end
     end
+    local signature = #candidateDiagnostics > 0
+        and table.concat(candidateDiagnostics, " | ") or "none"
+    if state.diagnostics.vrPanelCandidates ~= signature then
+        state.diagnostics.vrPanelCandidates = signature
+        log("info", "VR Results widget candidates unavailable: " .. signature)
+    end
     return nil
+end
+
+local function findMultiplayerVrResultsPanel(vrPanel, vrName)
+    local gameMode = findMultiplayerGameMode()
+    if not valid(gameMode) then
+        if state.diagnostics.multiplayerVrGameModeMissing ~= true then
+            state.diagnostics.multiplayerVrGameModeMissing = true
+            log("warn", "VR Results candidate rejected: multiplayer game mode unavailable panel="
+                .. tostring(vrName))
+        end
+        return nil
+    end
+    state.diagnostics.multiplayerVrGameModeMissing = nil
+    return vrPanel, vrName, "multiplayer_vr"
 end
 
 local function findActiveResultsPanel()
@@ -308,10 +378,34 @@ local function findActiveResultsPanel()
     -- needless UE4SS reflection churn while the Results widgets are attached.
     if state.mode == "flat" then
         return findFlatResultsPanel()
+    elseif state.mode == "multiplayer" then
+        return findMultiplayerResultsPanel()
+    elseif state.mode == "multiplayer_vr" then
+        local panel, name = findVrResultsPanel()
+        if panel == nil then return nil end
+        return findMultiplayerVrResultsPanel(panel, name)
     elseif state.mode == "vr" then
         return findVrResultsPanel()
     end
+    -- The Flat multiplayer mode has a native Flat results widget. Resolve it
+    -- before inspecting VR WidgetComponents; this avoids a full reflected
+    -- component scan on every poll throughout Flat multiplayer gameplay.
+    local multiplayerGameMode = findMultiplayerGameMode()
+    if valid(multiplayerGameMode) then
+        local gameModeName = fullName(multiplayerGameMode)
+        if gameModeName:find("FlatGameModeMulti", 1, true) ~= nil then
+            return findMultiplayerResultsPanel()
+        end
+    end
     local panel, name, mode = findVrResultsPanel()
+    if panel ~= nil then
+        local multiplayerPanel, multiplayerName, multiplayerMode = findMultiplayerVrResultsPanel(panel, name)
+        if multiplayerPanel ~= nil then
+            return multiplayerPanel, multiplayerName, multiplayerMode
+        end
+        return panel, name, mode
+    end
+    panel, name, mode = findMultiplayerResultsPanel()
     if panel ~= nil then
         return panel, name, mode
     end
@@ -411,21 +505,24 @@ local function findVrStatsComponent()
     return best
 end
 
-local function findVrScoreboardSurface()
+local function findVrScoreboardSurface(mode)
     if type(FindAllOf) ~= "function" then return nil, nil, nil end
+    -- Multiplayer's player scores occupy the ScoreboardWidget. Keep voting on
+    -- the separate song information surface so the controls never cover a
+    -- player's score row. Solo VR continues to use the scoreboard surface.
+    local preferredSurface = mode == "multiplayer_vr" and ".SongInfoWidget" or ".ScoreboardWidget"
     for _, component in ipairs(safeCall(function() return FindAllOf("WidgetComponent") end, {}) or {}) do
         if valid(component) then
             local name = fullName(component)
-            if name:find(".ScoreboardWidget", 1, true) ~= nil
+            if name:find(preferredSurface, 1, true) ~= nil
                 and safeCall(function() return component:IsVisible() end, false) then
             local user = safeCall(function() return component:GetUserWidgetObject() end, nil)
             local tree = valid(user) and safeCall(function() return user.WidgetTree end, nil) or nil
             local root = valid(tree) and safeCall(function() return tree.RootWidget end, nil) or nil
             if valid(user) and valid(root) then
-                -- CanvasPanel_1 is the authored Distance subpanel and is
-                -- clipped to the stock stats band.  Use the component root
-                -- surface for the mod-owned controls so they can occupy the
-                -- unused space beside Distance without moving stock widgets.
+                -- Use the component root surface. For multiplayer this is
+                -- the separate song information board; for solo VR it is the
+                -- scoreboard surface with room beside the Distance panel.
                 safeCall(function() user:SetVisibility(0) end, nil)
                 safeCall(function() user:SetIsEnabled(true) end, nil)
                 safeCall(function() root:SetVisibility(0) end, nil)
@@ -438,7 +535,7 @@ local function findVrScoreboardSurface()
                 state.scoreboardComponent = component
                 state.scoreboardUser = user
                 state.scoreboardRoot = root
-                log("info", "VR Scoreboard surface selected component=" .. name
+                log("info", "VR Results surface selected component=" .. name
                     .. " root=" .. fullName(root))
                 return component, user, root
             end
@@ -448,27 +545,6 @@ local function findVrScoreboardSurface()
     return nil, nil, nil
 end
 
-local function construct(classPath, outer, name)
-    if type(StaticFindObject) ~= "function" or type(StaticConstructObject) ~= "function" then
-        return nil
-    end
-    local class = safeCall(function()
-        return StaticFindObject(classPath)
-    end, nil)
-    if class == nil then
-        return nil
-    end
-    local objectName = 0
-    if name ~= nil and type(FName) == "function" then
-        objectName = safeCall(function()
-            return FName(name)
-        end, 0)
-    end
-    return safeCall(function()
-        return StaticConstructObject(class, outer, objectName, 0, 0, nil, false, false, nil)
-    end, nil)
-end
-
 local function setText(widget, value)
     if not valid(widget) then
         return false
@@ -476,8 +552,36 @@ local function setText(widget, value)
     local text = tostring(value or "")
     return safeCall(function()
         widget:SetText(FText(text))
+        -- FlatInGameButton's Text_ starts hidden in world-space Results.
+        -- Reveal the vote label explicitly so the VR controls are visible.
+        widget:SetVisibility(0)
+        widget:SetRenderOpacity(1.0)
         return true
     end, false)
+end
+
+local function setVoteLabelText(widget, value)
+    if not setText(widget, value) then return false end
+    if state.mode == "multiplayer_vr" then
+        -- Keep the label visible without intercepting the button beneath it.
+        safeCall(function() widget:SetVisibility(3) end, nil)
+        -- Match the single-player VR button proportions while leaving enough
+        -- horizontal room for the arrow and four-digit count.
+        safeCall(function() widget:SetRenderScale({ X = 2.4, Y = 2.0 }) end, nil)
+    end
+    return true
+end
+
+local function construct(classPath, outer, name)
+    if type(StaticFindObject) ~= "function" or type(StaticConstructObject) ~= "function" then
+        return nil
+    end
+    local class = safeCall(function() return StaticFindObject(classPath) end, nil)
+    if class == nil then return nil end
+    local objectName = type(FName) == "function" and safeCall(function() return FName(name) end, 0) or 0
+    return safeCall(function()
+        return StaticConstructObject(class, outer, objectName, 0, 0, nil, false, false, nil)
+    end, nil)
 end
 
 local function addToCanvas(canvas, widget, geometry)
@@ -515,6 +619,52 @@ local function addToCanvas(canvas, widget, geometry)
     safeCall(function() widget:SynchronizeProperties() end, nil)
     safeCall(function() canvas:InvalidateLayoutAndVolatility() end, nil)
     return true
+end
+
+local function createMultiplayerVrLabel(canvas, context, sourceText, label, geometry)
+    local tree = valid(context) and safeCall(function() return context.WidgetTree end, nil) or nil
+    local textClass = safeCall(function() return StaticFindObject("Class /Script/UMG.TextBlock") end, nil)
+    if not valid(textClass) then
+        textClass = safeCall(function() return StaticFindObject("/Script/UMG.TextBlock") end, nil)
+    end
+    if not valid(tree) or not valid(textClass) then return nil end
+    local name = "RagnaCustomsVoteLabel_" .. tostring(geometry.y)
+    local labelWidget = nil
+    pcall(function() labelWidget = tree:ConstructWidget(textClass, FName(name)) end)
+    if not valid(labelWidget) then labelWidget = construct("/Script/UMG.TextBlock", context, name) end
+    if not valid(labelWidget) then return nil end
+    if valid(sourceText) then
+        local font = safeCall(function() return sourceText:GetFont() end, nil)
+        if font ~= nil then safeCall(function() labelWidget:SetFont(font) end, nil) end
+        local color = safeCall(function() return sourceText:GetColorAndOpacity() end, nil)
+        if color ~= nil then safeCall(function() labelWidget:SetColorAndOpacity(color) end, nil) end
+        local shadow = safeCall(function() return sourceText:GetShadowOffset() end, nil)
+        if shadow ~= nil then safeCall(function() labelWidget:SetShadowOffset(shadow) end, nil) end
+    end
+    safeCall(function() labelWidget:SetAutoWrapText(false) end, nil)
+    safeCall(function() labelWidget:SetJustification(1) end, nil)
+    setText(labelWidget, label)
+    local slot = safeCall(function() return canvas:AddChildToCanvas(labelWidget) end, nil)
+    if not valid(slot) then slot = safeCall(function() return canvas:AddChild(labelWidget) end, nil) end
+    if not valid(slot) then
+        safeCall(function() labelWidget:RemoveFromParent() end, nil)
+        return nil
+    end
+    safeCall(function()
+        slot:SetAutoSize(true)
+        slot:SetPosition({ X = geometry.labelX or (geometry.x + geometry.width / 2), Y = geometry.y + geometry.height / 2 })
+        slot:SetAlignment({ X = 0.5, Y = 0.5 })
+        slot:SetZOrder((geometry.z or 9000) + 1)
+    end, nil)
+    safeCall(function() labelWidget:SetRenderScale({ X = 2.4, Y = 2.0 }) end, nil)
+    safeCall(function() labelWidget:SetVisibility(3) end, nil)
+    safeCall(function() labelWidget:SetRenderOpacity(1.0) end, nil)
+    safeCall(function() labelWidget:InvalidateLayoutAndVolatility() end, nil)
+    safeCall(function() canvas:InvalidateLayoutAndVolatility() end, nil)
+    log("info", "multiplayer VR label overlay attached name=" .. name
+        .. " pos=" .. tostring(geometry.x + geometry.width / 2) .. ","
+        .. tostring(geometry.y + geometry.height / 2))
+    return labelWidget
 end
 
 local function addButtonToCanvas(canvas, widget, geometry)
@@ -590,7 +740,7 @@ local function makeButton(canvas, context, mode, label, geometry)
     if not valid(root) then
         return nil
     end
-    if mode ~= "flat" then
+    if mode ~= "flat" and mode ~= "multiplayer" then
         safeCall(function()
             root:SetVisibility(0)
             root:SetRenderOpacity(1.0)
@@ -608,10 +758,14 @@ local function makeButton(canvas, context, mode, label, geometry)
         .. " class=" .. tostring(childClass)
         .. " visible=" .. tostring(childVisible))
     if valid(child) then
-        if not setText(child, label) then
+        local initialLabel = mode == "multiplayer_vr" and "" or label
+        if not setText(child, initialLabel) then
             log("error", "failed to label stock Results button label=" .. tostring(label))
         else
             log("info", "stock Results button labeled before attach label=" .. tostring(label))
+        end
+        if mode == "multiplayer_vr" then
+            safeCall(function() child:SetVisibility(2) end, nil)
         end
     end
     -- Do not reflect into the generated nested Button_64. On this build that
@@ -623,15 +777,22 @@ local function makeButton(canvas, context, mode, label, geometry)
     -- Keep the flat Results path to one simple transform call. On repeated
     -- Results screens SetRenderTransformPivot/Translation/Opacity can stall
     -- the game thread while the Blueprint wrapper is being attached.
-    if mode == "flat" then
+    if mode == "flat" or mode == "multiplayer" then
         safeCall(function() root:SetRenderScale({ X = 0.36, Y = 0.6 }) end, nil)
     else
         safeCall(function()
-            root:SetRenderTransformPivot({ X = 0.0, Y = 0.0 })
-            -- The native VR scoreboard surface is 840x195. Keep the
-            -- authored button content inside its slot; scaling it beyond the
-            -- slot makes the icon/count disappear at the right edge.
-            root:SetRenderScale({ X = 0.96, Y = 1.0 })
+            if mode == "multiplayer_vr" then
+                -- The stock button keeps a wider minimum visual width than
+                -- its Canvas slot. Shrink it from the left so its right edge
+                -- stays aligned beside the difficulty badge.
+                -- This surface is horizontally mirrored in VR. Pivot at the
+                -- far edge so increasing button scale grows away from the
+                -- difficulty badge instead of over it.
+                root:SetRenderTransformPivot({ X = 1.0, Y = 0.0 })
+                root:SetRenderScale({ X = 2.4, Y = 2.0 })
+            else
+                root:SetRenderScale({ X = 0.96, Y = 1.0 })
+            end
             root:SetRenderOpacity(1.0)
             root:SetRenderTransformTranslation({ X = 0.0, Y = 0.0 })
         end, nil)
@@ -641,6 +802,18 @@ local function makeButton(canvas, context, mode, label, geometry)
     if not attached then
         log("error", "failed to attach Results button widget label=" .. tostring(label))
         return nil
+    end
+    local renderedText = child
+    if mode == "multiplayer_vr" then
+        renderedText = createMultiplayerVrLabel(canvas, context, child, label, geometry)
+        if not valid(renderedText) then
+            renderedText = child
+            setText(child, label)
+            safeCall(function() child:SetRenderTransformPivot({ X = 0.5, Y = 0.5 }) end, nil)
+            safeCall(function() child:SetRenderScale({ X = 2.25, Y = 2.0 }) end, nil)
+            safeCall(function() child:SetJustification(1) end, nil)
+            safeCall(function() child:SetVisibility(3) end, nil)
+        end
     end
     local function slotDescription(widget)
         local slot = valid(widget) and safeCall(function() return widget.Slot end, nil) or nil
@@ -655,21 +828,30 @@ local function makeButton(canvas, context, mode, label, geometry)
         root = root,
         label = label,
         button = root,
-        text = child,
+        text = renderedText,
         objectPath = objectPath(root),
     }
 end
 
-local function makeFlatButton(canvas, context, label, geometry)
-    return makeButton(canvas, context, "flat", label, geometry)
+local function makeFlatButton(canvas, context, label, geometry, mode)
+    return makeButton(canvas, context, mode or "flat", label, geometry)
 end
 
-local function makeVrButton(canvas, context, label, geometry)
-    return makeButton(canvas, context, "vr", label, geometry)
+local function makeVrButton(canvas, context, label, geometry, mode)
+    return makeButton(canvas, context, mode or "vr", label, geometry)
 end
 
 local function createVoteButtons(canvas, context, mode, entries)
-    local make = mode == "vr" and makeVrButton or makeFlatButton
+    local make
+    if mode == "vr" or mode == "multiplayer_vr" then
+        make = function(targetCanvas, targetContext, label, geometry)
+            return makeVrButton(targetCanvas, targetContext, label, geometry, mode)
+        end
+    else
+        make = function(targetCanvas, targetContext, label, geometry)
+            return makeFlatButton(targetCanvas, targetContext, label, geometry, mode)
+        end
+    end
     local widgets = {}
     for _, entry in ipairs(entries) do
         local widget = make(canvas, context, entry.label, entry.geometry)
@@ -695,6 +877,9 @@ local function removeWidgets()
     local widgets = state.widgets
     if widgets ~= nil then
         for _, entry in pairs(widgets) do
+            if type(entry) == "table" and valid(entry.text) and entry.text ~= entry.root then
+                safeCall(function() entry.text:RemoveFromParent() end, nil)
+            end
             -- makeButton records the same owned widget as both root and
             -- button. Detach the parent wrapper once; its nested Text_ child
             -- is removed with it.
@@ -713,6 +898,7 @@ local function removeWidgets()
     state.widgets = nil
     state.resultsPanel = nil
     state.panelPath = nil
+    state.mode = nil
     state.loadedSongId = nil
     state.phase = "hidden"
     state.pressed = { up = false, down = false }
@@ -789,8 +975,19 @@ local function renderNow()
             value = tonumber(value) or 0
             return tostring(value)
         end
-        setText(widgets.up.text, "▲ " .. displayCount(state.upvotes))
-        setText(widgets.down.text, "▼ " .. displayCount(state.downvotes))
+        local upLabel = state.mode == "multiplayer_vr" and "▲" or "▲ "
+        local downLabel = state.mode == "multiplayer_vr" and "▼" or "▼ "
+        local upText = upLabel .. displayCount(state.upvotes)
+        local downText = downLabel .. displayCount(state.downvotes)
+        setVoteLabelText(widgets.up.text, upText)
+        setVoteLabelText(widgets.down.text, downText)
+        if state.mode == "multiplayer_vr" then
+            local labelState = upText .. "/" .. downText
+            if state.diagnostics.lastMultiplayerVrLabels ~= labelState then
+                state.diagnostics.lastMultiplayerVrLabels = labelState
+                log("info", "multiplayer VR vote labels set up=" .. upText .. " down=" .. downText)
+            end
+        end
     end
     if widgets.status ~= nil then setText(widgets.status.text, status) end
 end
@@ -882,24 +1079,54 @@ local function installApiEventHandlers()
     if state.apiEventsInstalled then return end
     state.apiEventsInstalled = true
     Api.on("vote.details.completed", function(payload)
+        log("info", "vote API event received name=vote.details.completed id="
+            .. tostring(payload and payload.id) .. " activeId=" .. tostring(state.songId))
         if payload == nil or tostring(payload.id) ~= tostring(state.songId) then return end
         applyResponse(apiVoteResult(payload.response, nil))
     end)
     Api.on("vote.details.failed", function(payload)
+        log("info", "vote API event received name=vote.details.failed id="
+            .. tostring(payload and payload.id) .. " activeId=" .. tostring(state.songId))
         if payload == nil or tostring(payload.id) ~= tostring(state.songId) then return end
         applyResponse(apiVoteResult(nil, payload.error))
     end)
     Api.on("vote.completed", function(payload)
+        log("info", "vote API event received name=vote.completed id="
+            .. tostring(payload and payload.id) .. " activeId=" .. tostring(state.songId))
         if payload == nil or tostring(payload.id) ~= tostring(state.songId) then return end
         applyResponse(apiVoteResult(payload.response, nil))
     end)
     Api.on("vote.failed", function(payload)
+        log("info", "vote API event received name=vote.failed id="
+            .. tostring(payload and payload.id) .. " activeId=" .. tostring(state.songId))
         if payload == nil or tostring(payload.id) ~= tostring(state.songId) then return end
         applyResponse(apiVoteResult(nil, payload.error))
     end)
 end
 
 loadVote = function()
+    local resolvedAt = tonumber(state.catalogResolvedAt)
+    if resolvedAt ~= nil and os and type(os.time) == "function" then
+        local remainingMs = 10500 - math.max(0, os.time() - resolvedAt) * 1000
+        if remainingMs > 0 then
+            if not state.voteDetailsDelayQueued then
+                state.voteDetailsDelayQueued = true
+                log("info", "delaying vote details request until catalog transport is released")
+                local scheduled, err = scheduleWithDelay(remainingMs, function()
+                    state.voteDetailsDelayQueued = false
+                    loadVote()
+                end, "vote details after catalog transport release")
+                if not scheduled then
+                    state.voteDetailsDelayQueued = false
+                    log("warn", "could not delay vote details request: " .. tostring(err))
+                else
+                    return
+                end
+            else
+                return
+            end
+        end
+    end
     state.recoveryQueued = false
     state.phase = "loading"
     -- The initial widgets are already disabled. Avoid queuing an extra Slate
@@ -908,7 +1135,16 @@ loadVote = function()
     local songId = state.songId
     local function startRequest()
         log("info", "vote details request starting id=" .. tostring(songId))
-        local _, err = Api.getSongVote(songId)
+        local ok, requestId, err = pcall(Api.getSongVote, songId)
+        if not ok then
+            log("error", "vote details request threw id=" .. tostring(songId)
+                .. " error=" .. tostring(requestId))
+            applyResponse(apiVoteResult(nil, { code = "start_failed", message = requestId }))
+            return
+        end
+        log("info", "vote details API returned id=" .. tostring(songId)
+            .. " request=" .. tostring(requestId)
+            .. (err ~= nil and " error=" .. tostring(err) or ""))
         if err ~= nil then
             applyResponse(apiVoteResult(nil, { code = "start_failed", message = err }))
         end
@@ -939,11 +1175,128 @@ local function submit(direction)
     end
 end
 
+local function cacheMultiplayerVrPointerTarget()
+    if type(FindAllOf) ~= "function" then return end
+    local interactions = safeCall(function() return FindAllOf("WidgetInteractionComponent") end, nil)
+    if type(interactions) ~= "table" then return end
+    for _, interaction in ipairs(interactions) do
+        if valid(interaction) then
+            local hovered = safeCall(function() return interaction:GetHoveredWidgetComponent() end, nil)
+            local hoveredPath = valid(hovered) and objectPath(hovered) or ""
+            if hoveredPath:find(".SongInfoWidget", 1, true) ~= nil then
+                local interactionPath = objectPath(interaction)
+                local changed = state.multiplayerVrPointerTargetPath ~= ".SongInfoWidget"
+                    or state.multiplayerVrPointerInteractionPath ~= interactionPath
+                state.multiplayerVrPointerTargetPath = ".SongInfoWidget"
+                state.multiplayerVrPointerInteractionPath = interactionPath
+                if changed then
+                    log("info", "multiplayer VR pointer target cached interaction=" .. interactionPath
+                        .. " surface=" .. hoveredPath)
+                end
+                return
+            end
+        end
+    end
+end
+
+local function installMultiplayerVrPointerHook()
+    if state.vrPointerHookInstalled or type(RegisterHook) ~= "function" then
+        return
+    end
+    local function onPointerPressed(...)
+        if state.mode ~= "multiplayer_vr" or state.phase ~= "ready" then
+            return
+        end
+        local interactions = {}
+        -- PressPointerKey supplies its receiver on this UE4SS build. Prefer it
+        -- because FindAllOf can return no live components during a pointer
+        -- press even though the harness and game both have an active ray.
+        local source = select(1, ...)
+        if valid(source) and objectPath(source):find("WidgetInteraction", 1, true) ~= nil then
+            interactions[1] = source
+        else
+            local found = safeCall(function()
+                return type(FindAllOf) == "function" and FindAllOf("WidgetInteractionComponent") or nil
+            end, nil)
+            if type(found) == "table" then interactions = found end
+        end
+        for _, interaction in ipairs(interactions) do
+            if valid(interaction) then
+                local hovered = safeCall(function() return interaction:GetHoveredWidgetComponent() end, nil)
+                local hoveredPath = valid(hovered) and objectPath(hovered) or ""
+                local hitResult = safeCall(function() return interaction:GetLastHitResult() end, nil)
+                local hitReference = safeCall(function() return hitResult and hitResult.Component end, nil)
+                local hitComponent = hitReference
+                for _, methodName in ipairs({ "Get", "GetObject", "get" }) do
+                    local resolved = safeCall(function()
+                        local method = hitReference and hitReference[methodName]
+                        return method and method(hitReference) or nil
+                    end, nil)
+                    if valid(resolved) then
+                        hitComponent = resolved
+                        break
+                    end
+                end
+                local hitPath = valid(hitComponent) and objectPath(hitComponent) or ""
+                local interactionPath = objectPath(interaction)
+                local hit = safeCall(function() return interaction:Get2DHitLocation() end, nil)
+                local x = tonumber(hit and hit.X) or -1
+                local y = tonumber(hit and hit.Y) or -1
+                log("info", "multiplayer VR pointer press observed hovered=" .. tostring(hoveredPath)
+                    .. " hitComponent=" .. tostring(hitPath)
+                    .. " hit=" .. tostring(x) .. "," .. tostring(y))
+                local songInfoTarget = hoveredPath:find(".SongInfoWidget", 1, true) ~= nil
+                    or hitPath:find(".SongInfoWidget", 1, true) ~= nil
+                if songInfoTarget then
+                    state.multiplayerVrPointerTargetPath = ".SongInfoWidget"
+                    state.multiplayerVrPointerInteractionPath = interactionPath
+                elseif (hoveredPath == "" or hoveredPath:find(".SongInfoWidget", 1, true) == nil)
+                    and (hitPath == "" or hitPath:match("^%x+$") ~= nil)
+                    and state.multiplayerVrPointerTargetPath == ".SongInfoWidget" then
+                    -- PressPointerKey sometimes clears HoveredWidgetComponent
+                    -- and returns an unresolved component reference while the
+                    -- cached Results ray still reports its local hit location.
+                    songInfoTarget = true
+                end
+                if songInfoTarget then
+                    -- On this world-space component, the interaction hit test
+                    -- The button press reports UMG-local hit coordinates on
+                    -- this build. Keep routing within the right-side strip.
+                    -- Keep the route constrained to that strip and the rows.
+                    local direction = nil
+                    if x >= 2050 and x <= 2150 and y >= 45 and y <= 69 then
+                        direction = "up"
+                    elseif x >= 2050 and x <= 2150 and y >= 175 and y <= 199 then
+                        direction = "down"
+                    end
+                    if direction ~= nil then
+                        log("info", "multiplayer VR pointer press mapped direction=" .. direction
+                            .. " hit=" .. tostring(x) .. "," .. tostring(y))
+                        submit(direction)
+                        return
+                    end
+                end
+            end
+        end
+    end
+    state.vrPointerHookCallback = onPointerPressed
+    local hookPath = "/Script/UMG.WidgetInteractionComponent:PressPointerKey"
+    local ok, hookError = pcall(RegisterHook, hookPath, onPointerPressed)
+    state.vrPointerHookInstalled = ok
+    log(ok and "info" or "warn", "multiplayer VR pointer hook registration path=" .. hookPath
+        .. " ok=" .. tostring(ok)
+        .. (hookError ~= nil and " error=" .. tostring(hookError) or ""))
+end
+
 local BUTTON_HANDLER_PATHS = {
     -- UE4SS 3.0.1 rejects the native SlateHandleClicked hook on this build.
     -- The generated Blueprint handler is registered for only the active UI
     -- flow and receives the wrapped button instance for direction filtering.
     flat = "/Game/Flat/Blueprints/UI/InGame/FlatInGameButton.FlatInGameButton_C:"
+        .. "BndEvt__FlatInGameButton_Button_64_K2Node_ComponentBoundEvent_0_OnButtonPressedEvent__DelegateSignature",
+    multiplayer = "/Game/Flat/Blueprints/UI/InGame/FlatInGameButton.FlatInGameButton_C:"
+        .. "BndEvt__FlatInGameButton_Button_64_K2Node_ComponentBoundEvent_0_OnButtonPressedEvent__DelegateSignature",
+    multiplayer_vr = "/Game/Flat/Blueprints/UI/InGame/FlatInGameButton.FlatInGameButton_C:"
         .. "BndEvt__FlatInGameButton_Button_64_K2Node_ComponentBoundEvent_0_OnButtonPressedEvent__DelegateSignature",
     vr = "/Game/Flat/Blueprints/UI/InGame/FlatInGameButton.FlatInGameButton_C:"
         .. "BndEvt__FlatInGameButton_Button_64_K2Node_ComponentBoundEvent_0_OnButtonPressedEvent__DelegateSignature",
@@ -1008,35 +1361,109 @@ local function installButtonHooks()
     end
 end
 
-local function createVrWidgets(panelPath)
-    local source, context, targetCanvas = findVrScoreboardSurface()
+local function createVrWidgets(panelPath, mode)
+    mode = mode or "vr"
+    local preferredSurface = mode == "multiplayer_vr" and "SongInfoWidget" or "ScoreboardWidget"
+    local source, context, targetCanvas = findVrScoreboardSurface(mode)
     if not valid(source) or not valid(context) or not valid(targetCanvas) then
-        log("error", "rendered ScoreboardWidget UMG root unavailable for VR vote buttons")
+        log("error", "rendered VR vote surface unavailable mode=" .. tostring(mode))
         return false
     end
-    local buttons = createVoteButtons(targetCanvas, context, "vr", {
-        { direction = "up", label = "▲ 0", geometry = { x = 1050, y = 453, width = 400, height = 78, z = 9000 } },
-        { direction = "down", label = "▼ 0", geometry = { x = 1050, y = 542, width = 400, height = 78, z = 9001 } },
-    })
+    if mode == "multiplayer_vr" then
+        local drawSize = safeCall(function() return source:GetDrawSize() end, nil)
+        local drawHeight = tonumber(drawSize and drawSize.Y) or 310
+        local location = safeCall(function() return source:K2_GetComponentLocation() end, nil)
+        local resized = safeCall(function()
+            source:SetDrawSize({ X = 2150, Y = drawHeight })
+            return true
+        end, false)
+        local repositioned = false
+        if location ~= nil then
+            repositioned = safeCall(function()
+                source:K2_SetWorldLocation({ X = location.X, Y = location.Y + 23.0, Z = location.Z }, false, {}, true)
+                return true
+            end, false)
+        end
+        log("info", "multiplayer VR SongInfoWidget draw size old="
+            .. tostring(drawSize and drawSize.X) .. "x" .. tostring(drawHeight)
+            .. " new=2150x" .. tostring(drawHeight) .. " applied=" .. tostring(resized)
+            .. " repositioned=" .. tostring(repositioned))
+        -- These two stock slots make up the Multiplayer difficulty badge.
+        -- They are right-anchored and extend into the same rightmost strip as
+        -- the votes, so move the badge left to make room for the button stack.
+        local tree = valid(context) and safeCall(function() return context.WidgetTree end, nil) or nil
+        local root = valid(tree) and safeCall(function() return tree.RootWidget end, nil) or nil
+        local wanted = { Border_0 = true, ScaleBox_163 = true }
+        local shifted = 0
+        local childCount = valid(root) and tonumber(safeCall(function() return root:GetChildrenCount() end, 0)) or 0
+        for index = 0, math.min(childCount or 0, 32) - 1 do
+            local widget = safeCall(function() return root:GetChildAt(index) end, nil)
+            local name = fullName(widget)
+            for widgetName in pairs(wanted) do
+                if wanted[widgetName] and name:find("WidgetTree." .. widgetName, 1, true) ~= nil then
+                    local slot = safeCall(function() return widget.Slot end, nil)
+                    local position = valid(slot) and safeCall(function() return slot:GetPosition() end, nil) or nil
+                    if position ~= nil then
+                        local ok = safeCall(function()
+                            slot:SetPosition({ X = position.X - 680.0, Y = position.Y })
+                            widget:InvalidateLayoutAndVolatility()
+                            return true
+                        end, false)
+                        if ok then
+                            shifted = shifted + 1
+                            wanted[widgetName] = false
+                        end
+                    end
+                end
+            end
+        end
+        if valid(root) then safeCall(function() root:InvalidateLayoutAndVolatility() end, nil) end
+        log("info", "multiplayer VR difficulty badge shifted left units=680 slots=" .. tostring(shifted))
+    end
+    -- Put multiplayer controls on SongInfoWidget, which is separate from the
+    -- player score list. The solo VR layout remains on ScoreboardWidget.
+    local entries
+    if mode == "multiplayer_vr" then
+        entries = {
+            -- Keep the vertical stack beside the difficulty badge, with room
+            -- for the arrow plus a four-digit count.
+            { direction = "up", label = "▲0", geometry = { x = 2050, y = 45, width = 100, height = 24, labelX = 1990, z = 9000 } },
+            { direction = "down", label = "▼0", geometry = { x = 2050, y = 175, width = 100, height = 24, labelX = 1990, z = 9001 } },
+        }
+    else
+        entries = {
+            { direction = "up", label = "▲ 0", geometry = { x = 1050, y = 453, width = 400, height = 78, z = 9000 } },
+            { direction = "down", label = "▼ 0", geometry = { x = 1050, y = 542, width = 400, height = 78, z = 9001 } },
+        }
+    end
+    local buttons = createVoteButtons(targetCanvas, context, mode, entries)
     if buttons == nil then
-        log("error", "failed to attach VR vote buttons to ScoreboardWidget")
+        log("error", "failed to attach VR vote buttons to " .. preferredSurface)
         return false
     end
     state.widgets = { container = nil, status = nil, up = buttons.up, down = buttons.down }
     state.panelPath = panelPath
-    state.mode = "vr"
+    state.mode = mode
     state.phase = "hidden"
     state.currentVote = nil
     state.upvotes = 0
     state.downvotes = 0
-    log("info", "created VR Results vote buttons on ScoreboardWidget root surface")
+    local layoutDescription = mode == "multiplayer_vr"
+        and "up=2050,45,100,24 down=2050,175,100,24"
+        or "up=1050,453,400,78 down=1050,542,400,78"
+    log("info", "created " .. mode .. " Results vote buttons on " .. preferredSurface
+        .. " root surface layout=" .. layoutDescription)
     installButtonHooks()
+    if mode == "multiplayer_vr" then
+        installMultiplayerVrPointerHook()
+    end
     state.loadedSongId = state.songId
     state.voteLoadPending = true
     return true
 end
 
-local function createFlatWidgets(panel, panelPath)
+local function createFlatWidgets(panel, panelPath, mode)
+    mode = mode or "flat"
     local canvas = findFlatInfoCanvas(panelPath)
     if not valid(canvas) then
         if not state.diagnostics.canvasMissing then
@@ -1045,16 +1472,24 @@ local function createFlatWidgets(panel, panelPath)
         end
         return false
     end
-    local buttonWidth, buttonHeight = 96, 42
+    -- Reuse the established single-player stack beside the difficulty label.
+    -- The multiplayer Flat results card has the same song-info surface, so
+    -- keep the same size, alignment, and vertical spacing there.
+    local buttonWidth, buttonHeight, x = 96, 42, 530
+    local entries = {
+        { direction = "up", label = "▲ 0", geometry = { x = x, y = 24, width = buttonWidth, height = buttonHeight, z = 9000 } },
+        { direction = "down", label = "▼ 0", geometry = { x = x, y = 80, width = buttonWidth, height = buttonHeight, z = 9001 } },
+    }
+    if mode == "multiplayer" then
+        log("info", "multiplayer Flat vote button layout up=530,24,96,42 down=530,80,96,42")
+    end
+    -- Preserve the proven single-player vertical stack in multiplayer too.
     -- Attach the owned buttons directly to the existing SongInfo surface.
     -- Creating an intermediate CanvasPanel and adding it to this live tree can
     -- stall UE4SS on the current build.
     log("info", "vote panel construct up begin")
     local buttonContext = panel
-    local buttons = createVoteButtons(canvas, buttonContext, "flat", {
-        { direction = "up", label = "▲ 0", geometry = { x = 530, y = 24, width = buttonWidth, height = buttonHeight, z = 9000 } },
-        { direction = "down", label = "▼ 0", geometry = { x = 530, y = 80, width = buttonWidth, height = buttonHeight, z = 9001 } },
-    })
+    local buttons = createVoteButtons(canvas, buttonContext, mode, entries)
     log("info", "vote panel construct up done")
     log("info", "vote panel construct down done")
     if buttons == nil then
@@ -1075,12 +1510,12 @@ local function createFlatWidgets(panel, panelPath)
         down = buttons.down,
     }
     state.panelPath = panelPath
-    state.mode = "flat"
+    state.mode = mode
     state.phase = "hidden"
     state.currentVote = nil
     state.upvotes = 0
     state.downvotes = 0
-    log("info", "created standalone flat Results vote panel")
+    log("info", "created standalone " .. mode .. " Results vote panel")
     installButtonHooks()
     state.loadedSongId = state.songId
     state.voteLoadPending = true
@@ -1089,12 +1524,18 @@ end
 
 local function createWidgets(panel, panelPath, mode)
     if mode == "vr" then
-        return createVrWidgets(panelPath)
+        return createVrWidgets(panelPath, mode)
+    end
+    if mode == "multiplayer_vr" then
+        return createVrWidgets(panelPath, mode)
+    end
+    if mode == "multiplayer" then
+        return createFlatWidgets(panel, panelPath, mode)
     end
     if valid(findVrStatsComponent()) then
         return createVrWidgets(panelPath)
     end
-    return createFlatWidgets(panel, panelPath)
+    return createFlatWidgets(panel, panelPath, mode)
 end
 
 local function extractHash(...)
@@ -1491,10 +1932,23 @@ local function resolveCatalogId(folder, metadata, generation)
         state.resolutionPending = false
         if id ~= nil then
             state.songId = tonumber(id)
+            state.catalogResolvedAt = os and type(os.time) == "function" and os.time() or nil
             log("info", message .. " id=" .. tostring(state.songId))
         end
     end
     local cached = type(Api.readInstalledSongId) == "function" and safeCall(function() return Api.readInstalledSongId(folder) end, nil) or nil
+    local cachedId = tonumber(cached)
+    if cachedId ~= nil and cachedId > 0 then
+        -- The API's .id marker is the catalog association saved when this
+        -- custom song was installed. Trust that explicit association and
+        -- avoid overlapping catalog search requests with the Results vote
+        -- state request on this UE4SS/VaRest build.
+        state.songId = cachedId
+        state.catalogResolvedAt = nil
+        state.resolutionPending = false
+        log("info", "using installed catalog ID id=" .. tostring(cachedId))
+        return
+    end
     local mapperFallbackAttempted = false
     local function discovered(id, err, result)
         if err ~= nil then
@@ -1748,6 +2202,8 @@ local function poll()
         -- unchanged.
         state.captureManagerPath = nil
         state.captureResolved = false
+        state.multiplayerVrPointerTargetPath = nil
+        state.multiplayerVrPointerInteractionPath = nil
     end
     if state.voteLoadPending and state.widgets ~= nil then
         state.voteLoadPending = false
@@ -1848,8 +2304,14 @@ local function poll()
         return
     end
     state.lastSuppressionReason = nil
-    if not state.diagnostics.panelFound then
-        state.diagnostics.panelFound = true
+    if mode == "multiplayer_vr" then
+        -- PressPointerKey may clear both hovered and hit-result references
+        -- before the hook runs. Remember the live ray target during normal
+        -- Results polling so the click can still be scoped to SongInfoWidget.
+        cacheMultiplayerVrPointerTarget()
+    end
+    if state.diagnostics.panelFoundMode ~= mode then
+        state.diagnostics.panelFoundMode = mode
         log("info", "found active " .. tostring(mode) .. " Results panel")
     end
     local path = rootPath(panelName)
@@ -1924,3 +2386,4 @@ if not schedulePoll() then
 end
 
 log("info", "loaded; waiting for a custom-song Results screen")
+log("info", "multiplayer Results flow enabled")
