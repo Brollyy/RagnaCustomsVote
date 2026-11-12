@@ -1,6 +1,6 @@
 # RagnaCustomsVote
 
-UE4SS Lua mod for Ragnarock that adds custom-song voting controls to the Flat and PC-VR Results screens.
+UE4SS Lua mod for Ragnarock that adds custom-song voting controls to Flat and PC-VR Results, including Multiplayer support in both modes.
 
 Requires [`RagnaCustomsApi`](https://github.com/Brollyy/RagnaCustomsApi) 0.3.0 or newer.
 
