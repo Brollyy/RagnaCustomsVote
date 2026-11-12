@@ -552,10 +552,6 @@ local function setText(widget, value)
     local text = tostring(value or "")
     return safeCall(function()
         widget:SetText(FText(text))
-        -- FlatInGameButton's Text_ starts hidden in world-space Results.
-        -- Reveal the vote label explicitly so the VR controls are visible.
-        widget:SetVisibility(0)
-        widget:SetRenderOpacity(1.0)
         return true
     end, false)
 end
@@ -832,6 +828,7 @@ local function makeButton(canvas, context, mode, label, geometry)
         label = label,
         button = root,
         text = renderedText,
+        geometry = geometry,
         objectPath = objectPath(root),
     }
 end
@@ -897,6 +894,30 @@ local function removeWidgets()
     if valid(state.vrOverlayComponent) then
         safeCall(function() state.vrOverlayComponent:DestroyComponent() end, nil)
     end
+    if state.multiplayerVrSurfaceSnapshot ~= nil then
+        local snapshot = state.multiplayerVrSurfaceSnapshot
+        if valid(snapshot.component) then
+            if snapshot.drawSize ~= nil then
+                safeCall(function() snapshot.component:SetDrawSize(snapshot.drawSize) end, nil)
+            end
+            if snapshot.location ~= nil then
+                safeCall(function()
+                    snapshot.component:K2_SetWorldLocation(snapshot.location, false, {}, true)
+                end, nil)
+            end
+        end
+        for _, entry in ipairs(snapshot.slots or {}) do
+            if valid(entry.slot) and entry.position ~= nil then
+                safeCall(function() entry.slot:SetPosition(entry.position) end, nil)
+            end
+        end
+        if valid(snapshot.root) then
+            safeCall(function() snapshot.root:InvalidateLayoutAndVolatility() end, nil)
+        end
+        state.multiplayerVrSurfaceSnapshot = nil
+    end
+    state.multiplayerVrPointerTargetPath = nil
+    state.multiplayerVrPointerInteractionPath = nil
     state.vrOverlayComponent = nil
     state.widgets = nil
     state.resultsPanel = nil
@@ -1140,7 +1161,11 @@ end
 local function cacheMultiplayerVrPointerTarget()
     if type(FindAllOf) ~= "function" then return end
     local interactions = safeCall(function() return FindAllOf("WidgetInteractionComponent") end, nil)
-    if type(interactions) ~= "table" then return end
+    if type(interactions) ~= "table" then
+        state.multiplayerVrPointerTargetPath = nil
+        state.multiplayerVrPointerInteractionPath = nil
+        return
+    end
     for _, interaction in ipairs(interactions) do
         if valid(interaction) then
             local hovered = safeCall(function() return interaction:GetHoveredWidgetComponent() end, nil)
@@ -1159,6 +1184,8 @@ local function cacheMultiplayerVrPointerTarget()
             end
         end
     end
+    state.multiplayerVrPointerTargetPath = nil
+    state.multiplayerVrPointerInteractionPath = nil
 end
 
 local function installMultiplayerVrPointerHook()
@@ -1216,9 +1243,10 @@ local function installMultiplayerVrPointerHook()
                 if songInfoTarget then
                     state.multiplayerVrPointerTargetPath = ".SongInfoWidget"
                     state.multiplayerVrPointerInteractionPath = interactionPath
-                elseif (hoveredPath == "" or hoveredPath:find(".SongInfoWidget", 1, true) == nil)
+                elseif hoveredPath == ""
                     and (hitPath == "" or hitPath:match("^%x+$") ~= nil)
-                    and state.multiplayerVrPointerTargetPath == ".SongInfoWidget" then
+                    and state.multiplayerVrPointerTargetPath == ".SongInfoWidget"
+                    and state.multiplayerVrPointerInteractionPath == interactionPath then
                     -- PressPointerKey sometimes clears HoveredWidgetComponent
                     -- and returns an unresolved component reference while the
                     -- cached Results ray still reports its local hit location.
@@ -1230,10 +1258,14 @@ local function installMultiplayerVrPointerHook()
                     -- this build. Keep routing within the right-side strip.
                     -- Keep the route constrained to that strip and the rows.
                     local direction = nil
-                    if x >= 2050 and x <= 2150 and y >= 45 and y <= 69 then
-                        direction = "up"
-                    elseif x >= 2050 and x <= 2150 and y >= 175 and y <= 199 then
-                        direction = "down"
+                    for _, candidate in ipairs({ "up", "down" }) do
+                        local entry = state.widgets and state.widgets[candidate]
+                        local geometry = entry and entry.geometry
+                        if geometry ~= nil and x >= geometry.x and x <= geometry.x + geometry.width
+                            and y >= geometry.y and y <= geometry.y + geometry.height then
+                            direction = candidate
+                            break
+                        end
                     end
                     if direction ~= nil then
                         log("info", "multiplayer VR pointer press mapped direction=" .. direction
@@ -1327,9 +1359,21 @@ local function createVrWidgets(panelPath, mode)
         -- SongInfoWidget is narrower than the free area needed beside its
         -- difficulty badge. Expand the surface and move the badge slots left
         -- to reserve a clear strip for the vote buttons.
+        local previousSnapshot = state.multiplayerVrSurfaceSnapshot
+        if previousSnapshot ~= nil and previousSnapshot.component ~= source then
+            removeWidgets()
+        end
         local drawSize = safeCall(function() return source:GetDrawSize() end, nil)
         local drawHeight = tonumber(drawSize and drawSize.Y) or 310
         local location = safeCall(function() return source:K2_GetComponentLocation() end, nil)
+        if state.multiplayerVrSurfaceSnapshot == nil then
+            state.multiplayerVrSurfaceSnapshot = {
+                component = source,
+                drawSize = drawSize,
+                location = location,
+                slots = {},
+            }
+        end
         local resized = safeCall(function()
             source:SetDrawSize({ X = 2150, Y = drawHeight })
             return true
@@ -1350,6 +1394,9 @@ local function createVrWidgets(panelPath, mode)
         -- the votes, so move the badge left to make room for the button stack.
         local tree = valid(context) and safeCall(function() return context.WidgetTree end, nil) or nil
         local root = valid(tree) and safeCall(function() return tree.RootWidget end, nil) or nil
+        if state.multiplayerVrSurfaceSnapshot ~= nil then
+            state.multiplayerVrSurfaceSnapshot.root = root
+        end
         local wanted = { Border_0 = true, ScaleBox_163 = true }
         local shifted = 0
         local childCount = valid(root) and tonumber(safeCall(function() return root:GetChildrenCount() end, 0)) or 0
@@ -1361,6 +1408,8 @@ local function createVrWidgets(panelPath, mode)
                     local slot = safeCall(function() return widget.Slot end, nil)
                     local position = valid(slot) and safeCall(function() return slot:GetPosition() end, nil) or nil
                     if position ~= nil then
+                        local snapshot = state.multiplayerVrSurfaceSnapshot
+                        table.insert(snapshot.slots, { slot = slot, position = position })
                         local ok = safeCall(function()
                             slot:SetPosition({ X = position.X - 680.0, Y = position.Y })
                             widget:InvalidateLayoutAndVolatility()
@@ -1395,6 +1444,7 @@ local function createVrWidgets(panelPath, mode)
     end
     local buttons = createVoteButtons(targetCanvas, context, mode, entries)
     if buttons == nil then
+        if mode == "multiplayer_vr" then removeWidgets() end
         log("error", "failed to attach VR vote buttons to " .. preferredSurface)
         return false
     end
@@ -1551,23 +1601,6 @@ local function findPlayedSongManager()
     return nil
 end
 
-local function extractSongId(value)
-    value = unwrap(value)
-    if value == nil then return nil end
-    local numeric = tonumber(value)
-    if numeric ~= nil and numeric > 0 then
-        return math.floor(numeric)
-    end
-    local text = tostring(value):gsub("\\", "/")
-    local id = text:match("ragnac://install/(%d+)")
-        or text:match("/songs/[^/]+/(%d+)")
-        or text:match("/song/(%d+)")
-        or text:match("/CustomSongs/(%d+)")
-        or text:match("/(%d+)/?$")
-        or text:match("[%W_]id[%W_]*(%d+)")
-    return id and tonumber(id) or nil
-end
-
 local function textValue(value)
     if value == nil then return nil end
     if type(value) == "string" then return value:gsub("^%s+", ""):gsub("%s+$", "") end
@@ -1603,20 +1636,6 @@ local function invokeMember(object, name)
     -- object's reflected CallFunction path.
     if direct ~= nil and type(direct) ~= "function" then return direct end
     return safeCall(function() return object:CallFunction(member) end, nil)
-end
-
-local function configureApiFromReflectedGameSettings()
-    if type(Api.configureFromGameCustomApiUrls) ~= "function" then return false end
-    local ok, configured = pcall(Api.configureFromGameCustomApiUrls)
-    if not ok then
-        log("warn", "could not configure API from Ragnarock settings: " .. tostring(configured))
-        return false
-    end
-    if configured ~= nil then
-        log("info", "configured API from Ragnarock CustomApiURLs base=" .. tostring(configured.apiBaseUrl))
-        return true
-    end
-    return false
 end
 
 local function objectValue(object, names)
@@ -1757,29 +1776,6 @@ local function listProperty(object, names)
 end
 
 local function songMetadata(song, beatMap)
-    if false then
-        state.diagnostics.getterProbe = true
-        for _, name in ipairs({ "GetPath", "GetName", "GetBand", "GetLevelAuthor", "GetBeatMapsLevels" }) do
-            local raw = invokeMember(song, name)
-            log("info", "live getter probe name=" .. name .. " raw=" .. tostring(raw)
-                .. " type=" .. type(raw) .. " valueType=" .. tostring(safeCall(function() return raw:type() end, nil))
-                .. " tostring=" .. tostring(safeCall(function() return raw:ToString() end, nil))
-                .. " get=" .. tostring(safeCall(function() return raw:get() end, nil))
-                .. " text=" .. tostring(textValue(raw)))
-            if type(raw) == "table" then
-                for index, entry in ipairs(raw) do
-                    if index <= 16 then
-                        log("info", "live getter table name=" .. name .. " index=" .. tostring(index)
-                            .. " entry=" .. tostring(entry) .. " entryType=" .. type(entry)
-                            .. " valueType=" .. tostring(safeCall(function() return entry:type() end, nil))
-                            .. " get=" .. tostring(safeCall(function() return entry:get() end, nil))
-                            .. " Get=" .. tostring(safeCall(function() return entry:Get() end, nil))
-                            .. " text=" .. tostring(textValue(entry)))
-                    end
-                end
-            end
-        end
-    end
     local metadata = {
         title = property(song, { "GetName", "Title", "@Title", "@Name" })
             or property(beatMap, { "Title", "@Title", "@Name" }),
@@ -1814,75 +1810,9 @@ local function songMetadata(song, beatMap)
     return metadata
 end
 
-local function probeLiveProperties(object, label, names)
-    if object == nil then return end
-    for _, name in ipairs(names or {}) do
-        name = rootReflectionString(name)
-        local value = safeCall(function() return object:GetPropertyValue(name) end, nil)
-        local direct = safeCall(function() return object[name] end, nil)
-        if value ~= nil then
-            local text = textValue(value)
-            log("info", "live property probe object=" .. label .. " name=" .. name
-                .. " raw=" .. tostring(value) .. " type=" .. type(value)
-                .. " direct=" .. tostring(direct) .. " directType=" .. type(direct)
-                .. " text=" .. tostring(text))
-        end
-    end
-    local class = safeCall(function() return object:GetClass() end, nil)
-    log("info", "live reflected class object=" .. label .. " class=" .. tostring(class) .. " className=" .. tostring(fullName(class)))
-    if class ~= nil then
-        local count = 0
-        local visited = 0
-        while valid(class) and visited < 12 and count < 160 do
-            visited = visited + 1
-            safeCall(function()
-                class:ForEachProperty(function(prop)
-                    count = count + 1
-                    if count <= 160 then
-                        local propName = safeCall(function() return prop:GetFullName() end, nil)
-                            or safeCall(function() return prop:GetName() end, nil)
-                        local shortName = rootReflectionString(
-                            tostring(propName or ""):match("([^%.:]+)$") or tostring(propName or ""))
-                        local raw = safeCall(function() return object:GetPropertyValue(shortName) end, nil)
-                        local directValue = safeCall(function() return object[shortName] end, nil)
-                        log("info", "live reflected property object=" .. label
-                            .. " name=" .. tostring(shortName)
-                            .. " raw=" .. tostring(raw) .. " rawType=" .. type(raw)
-                            .. " direct=" .. tostring(directValue) .. " directType=" .. type(directValue)
-                            .. " text=" .. tostring(textValue(raw) or textValue(directValue)))
-                    end
-                    return false
-                end)
-            end, nil)
-            class = safeCall(function() return class:GetSuperStruct() end, nil)
-        end
-        log("info", "live reflected property count object=" .. label .. " count=" .. tostring(count))
-        local functionCount = 0
-        class = safeCall(function() return object:GetClass() end, nil)
-        visited = 0
-        while valid(class) and visited < 12 and functionCount < 240 do
-            visited = visited + 1
-            safeCall(function()
-                class:ForEachFunction(function(fn)
-                    functionCount = functionCount + 1
-                    if functionCount <= 240 then
-                        log("info", "live reflected function object=" .. label
-                            .. " name=" .. tostring(safeCall(function() return fn:GetFullName() end, nil)
-                                or safeCall(function() return fn:GetName() end, nil)))
-                    end
-                end)
-            end, nil)
-            class = safeCall(function() return class:GetSuperStruct() end, nil)
-        end
-        log("info", "live reflected function count object=" .. label .. " count=" .. tostring(functionCount))
-    end
-end
-
 local function resolveCatalogId(folder, metadata, generation)
     if folder == nil or metadata == nil or state.resolutionPending then return end
-    local settingsOk, configured = pcall(configureApiFromReflectedGameSettings)
-    if not settingsOk then configured = false end
-    if not configured then configureApiFromGameSettings() end
+    configureApiFromGameSettings()
     state.resolutionPending = true
     local function finish(id, message)
         if generation ~= state.resolutionGeneration then return end
@@ -2068,20 +1998,6 @@ local function resolvePlayedSongState(manager)
         mapper = nil,
         difficulties = {},
     })
-    if false then
-        state.diagnostics.livePropertiesProbed = true
-        probeLiveProperties(song, "Song", {
-            "Title", "SongTitle", "SongName", "Name", "Artist", "ArtistName", "AuthorName",
-            "Mapper", "LevelAuthorName", "SongPath", "FolderPath", "CustomSongPath", "FilePath",
-            "m_title", "m_songName", "m_name", "m_artist", "m_authorName", "m_mapper", "m_songPath", "m_folderPath",
-        })
-        probeLiveProperties(beatMap, "BeatMap", {
-            "Title", "SongTitle", "SongName", "Name", "Artist", "ArtistName", "AuthorName",
-            "Mapper", "LevelAuthorName", "SongPath", "FolderPath", "CustomSongPath", "FilePath",
-            "m_title", "m_songName", "m_name", "m_artist", "m_authorName", "m_mapper", "m_songPath", "m_folderPath",
-            "GetLevel", "Difficulty", "DifficultyRank", "GetDifficultyRank", "m_difficultyRank",
-        })
-    end
     local difficultyText = {}
     for _, difficulty in ipairs(metadata.difficulties or {}) do table.insert(difficultyText, tostring(difficulty)) end
     log("info", "live song metadata folder=" .. tostring(folder)
